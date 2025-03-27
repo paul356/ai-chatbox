@@ -1,24 +1,21 @@
 use anyhow;
 use esp_idf_svc::hal::{
-    gpio::{Gpio21, InputPin, OutputPin},
+    gpio::{InputPin, OutputPin},
     i2s::{
         config::{
             ClockSource, Config, DataBitWidth, MclkMultiple, PdmDownsample, PdmRxClkConfig,
             PdmRxConfig, PdmRxGpioConfig, PdmRxSlotConfig, SlotMode,
         },
-        I2s, I2sDriver, I2sRx, I2S0,
+        I2s, I2sDriver, I2sRx,
     },
     peripheral::Peripheral,
     peripherals::{self, Peripherals},
-    sd::{config::Configuration, spi::SdSpiHostDriver, SdCardDriver},
-    spi::{Dma, SpiDriver, SpiDriverConfig},
-    sys::{self, esp},
 };
 use esp_idf_svc::sys::esp_sr::{afe_config_init, esp_srmodel_init};
 use esp_idf_svc::sys::{configTICK_RATE_HZ, vTaskDelay};
 use std::ffi::CString;
 
-sys::esp_app_desc!();
+mod sd_card;
 
 fn init_mic<'d>(
     i2s_slot: impl Peripheral<P = impl I2s> + 'd,
@@ -60,32 +57,8 @@ fn main() -> anyhow::Result<()> {
         peripherals.pins.gpio41,
     )?;
 
-    let spi_driver_cfg = SpiDriverConfig::new().dma(Dma::Auto(4000));
-    let spi_driver = SpiDriver::new(
-        peripherals.spi2,
-        peripherals.pins.gpio7,
-        peripherals.pins.gpio9,
-        Some(peripherals.pins.gpio8),
-        &spi_driver_cfg,
-    )?;
-
-    log::info!("Before sd spi host driver");
-    let sd_spi_driver = SdSpiHostDriver::new(
-        &spi_driver,
-        Some(peripherals.pins.gpio21),
-        Option::<Gpio21>::None,
-        Option::<Gpio21>::None,
-        Option::<Gpio21>::None,
-        Some(false),
-    )?;
-
-    let sdcard_cfg = Configuration::new();
-
-    log::info!("Before sd card driver");
-    let sdcard_driver = SdCardDriver::new_spi(sd_spi_driver, &sdcard_cfg)?;
-
-    /*let mut sdcard = sd_card::SdCard::new("/vfat");
-    sdcard.mount_spi()?;*/
+    let mut sd = sd_card::SdCard::new("/vfat");
+    sd.mount_spi()?;
 
     log::info!("Before entering loop");
     loop {
