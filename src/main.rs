@@ -25,6 +25,13 @@ use sys::esp_sr::{
     esp_srmodel_init, esp_afe_sr_iface_t, esp_afe_sr_data_t, esp_mn_iface_t, model_iface_data_t
 };
 use sys::{configTICK_RATE_HZ, vTaskDelay};
+use std::sync::mpsc::{self, Sender, Receiver};
+
+// Define the ActionRequest enum
+enum ActionRequest {
+    CommandDetected(i32), // Represents a detected command with an ID
+    OtherAction(i32),     // Represents other actions with an ID
+}
 
 mod sd_card;
 
@@ -33,6 +40,15 @@ struct FeedTaskArg {
     afe_data: *mut esp_sr::esp_afe_sr_data_t,
     multinet: *mut esp_sr::esp_mn_iface_t,
     model_data: *mut esp_sr::model_iface_data_t,
+    receiver: Receiver<ActionRequest>, // Add Receiver to the feed task arguments
+}
+
+struct FetchTaskArg {
+    afe_handle: *mut esp_sr::esp_afe_sr_iface_t,
+    afe_data: *mut esp_sr::esp_afe_sr_data_t,
+    multinet: *mut esp_sr::esp_mn_iface_t,
+    model_data: *mut esp_sr::model_iface_data_t,
+    sender: Sender<ActionRequest>, // Add Sender to the fetch task arguments
 }
 
 fn init_mic<'d>(
@@ -97,35 +113,19 @@ fn inner_feed_proc(feed_arg: &Box<FeedTaskArg>) -> anyhow::Result<()> {
 
     //let mut file_idx = 0;
     loop {
-        /*
-        let spec = WavSpec {
-            channels: 1,
-            sample_rate: 44100,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-
-        let mut writer = WavWriter::create(std::format!("/vfat/audio{}.wav", file_idx), spec)?;
-
-        let read_cnt = mic.read(chunk.as_mut_slice(), 100)?;
-
-        let mut size = 0;
-        while size < (44100 * 2 * 10) {
-            let read_cnt = mic.read(chunk.as_mut_slice(), 100)?;
-            if read_cnt == 0 {
-                break;
-            }
-            size += read_cnt;
-
-            for i in 0..(read_cnt / 2) {
-                let sample = i16::from_ne_bytes([chunk[i * 2], chunk[i * 2 + 1]]);
-                writer.write_sample(sample)?;
+        // Check for messages from the fetch task
+        if let Ok(message) = feed_arg.receiver.try_recv() {
+            match message {
+                ActionRequest::CommandDetected(command_id) => {
+                    log::info!("[FEED TASK] Command detected with ID: {}", command_id);
+                    // Handle the command (e.g., adjust behavior based on the command ID)
+                }
+                ActionRequest::OtherAction(action_id) => {
+                    log::info!("[FEED TASK] Other action requested with ID: {}", action_id);
+                    // Handle other actions
+                }
             }
         }
-
-        writer.finalize()?;
-        file_idx += 1;
-        */
 
         mic.read(chunk.as_mut_slice(), 100)?;
         let _ = call_c_method!(feed_arg.afe_handle, feed, feed_arg.afe_data, chunk.as_ptr() as *const i16)?;
@@ -141,7 +141,7 @@ extern "C" fn feed_proc(arg: * mut std::ffi::c_void) {
     inner_feed_proc(&feed_arg).unwrap();
 }
 
-fn inner_fetch_proc(arg: &Box<FeedTaskArg>) -> anyhow::Result<()> {
+fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     let afe_handle = arg.afe_handle;
     let afe_data = arg.afe_data;
     let multinet = arg.multinet;
@@ -174,11 +174,13 @@ fn inner_fetch_proc(arg: &Box<FeedTaskArg>) -> anyhow::Result<()> {
             if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_DETECTED {
                 let mn_result = call_c_method!(multinet, get_results, model_data)?;
                 for i in 0..unsafe { (*mn_result).num as usize } {
-                    log::info!(
-                        "Command detected: {}, String: {:?}",
-                        unsafe { (*mn_result).command_id[i] },
-                        unsafe { (*mn_result).string }
-                    );
+                    let command_id = unsafe { (*mn_result).command_id[i] };
+                    log::info!("Command detected: {}", command_id);
+
+                    // Send the detected command as an ActionRequest to the feed task
+                    if let Err(err) = arg.sender.send(ActionRequest::CommandDetected(command_id)) {
+                        log::error!("[FETCH TASK] Failed to send message: {}", err);
+                    }
                 }
             } else if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_TIMEOUT {
                 log::info!("Timeout, no command detected");
@@ -192,7 +194,7 @@ fn inner_fetch_proc(arg: &Box<FeedTaskArg>) -> anyhow::Result<()> {
 }
 
 extern "C" fn fetch_proc(arg: * mut std::ffi::c_void) {
-    let feed_arg = unsafe { Box::from_raw(arg as *mut FeedTaskArg) };
+    let feed_arg = unsafe { Box::from_raw(arg as *mut FetchTaskArg) };
 
     let res = inner_fetch_proc(&feed_arg);
 }
@@ -248,22 +250,27 @@ fn main() -> anyhow::Result<()> {
         esp_mn_commands_update();
     }
 
+    // Create a communication channel
+    let (sender, receiver) = mpsc::channel();
+
     let feed_task_arg = Box::new(FeedTaskArg {
         afe_handle,
         afe_data,
         multinet,
         model_data,
+        receiver, // Pass the Receiver to the feed task
     });
 
     let _ = unsafe {
         hal::task::create(feed_proc, &*CString::new("feed_task").unwrap(), 8 * 1024, Box::into_raw(feed_task_arg) as *mut c_void, 5, None)
     }?;
 
-    let fetch_task_arg = Box::new(FeedTaskArg {
+    let fetch_task_arg = Box::new(FetchTaskArg {
         afe_handle,
         afe_data,
         multinet,
         model_data,
+        sender, // Pass the Sender to the fetch task
     });
 
     let _ = unsafe {
