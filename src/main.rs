@@ -123,6 +123,64 @@ enum State {
     RECORDING,
 }
 
+// Add a function to print afe_fetch_result_t fields
+fn print_fetch_result(res: *const esp_sr::afe_fetch_result_t) {
+    unsafe {
+        log::info!("--- AFE Fetch Result ---");
+        log::info!("data_size: {} bytes", (*res).data_size);
+        log::info!("vad_cache_size: {} bytes", (*res).vad_cache_size);
+        log::info!("data_volume: {} dB", (*res).data_volume);
+        log::info!("wakeup_state: {}", (*res).wakeup_state);
+        log::info!("wake_word_index: {}", (*res).wake_word_index);
+        log::info!("wakenet_model_index: {}", (*res).wakenet_model_index);
+        log::info!("vad_state: {}", (*res).vad_state);
+        log::info!("trigger_channel_id: {}", (*res).trigger_channel_id);
+        log::info!("wake_word_length: {} samples", (*res).wake_word_length);
+        log::info!("ret_value: {}", (*res).ret_value);
+        log::info!("raw_data_channels: {}", (*res).raw_data_channels);
+        log::info!("--- End of Fetch Result ---");
+    }
+}
+
+// Add this helper function to flush FatFs filesystem
+fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
+    // Create a temporary file to force a flush of the file system
+    let flush_path = format!("{}/flush.tmp", mount_point);
+    {
+        let file = std::fs::File::create(&flush_path)?;
+        file.sync_all()?; // This calls fsync() which flushes dirty data
+    }
+    // Remove the temporary file
+    std::fs::remove_file(&flush_path)?;
+
+    // On ESP-IDF, we can also directly call the esp_vfs_fat_sdmmc_unmount function
+    // But we need to use the unsafe FFI call
+    unsafe {
+        #[allow(non_snake_case)]
+        extern "C" {
+            fn esp_vfs_fat_sdcard_unmount(mount_point: *const std::os::raw::c_char, card: *mut std::os::raw::c_void) -> i32;
+        }
+
+        // This is a more aggressive approach - unmount and remount
+        // Only use if the above sync_all approach doesn't work
+        /*
+        let c_mount_point = CString::new(mount_point)?;
+        let result = esp_vfs_fat_sdcard_unmount(c_mount_point.as_ptr(), std::ptr::null_mut());
+        if result != 0 {
+            log::warn!("Failed to unmount SD card: {}", result);
+        }
+
+        // Remount the card
+        let mut sd = sd_card::SdCard::new(mount_point);
+        sd.mount_spi()?;
+        */
+    }
+
+    log::info!("Filesystem at {} flushed successfully", mount_point);
+    Ok(())
+}
+
+// Modify the RECORDING state code to flush data after finalizing WAV file
 fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     let afe_handle = arg.afe_handle;
     let afe_data = arg.afe_data;
@@ -210,6 +268,9 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
             },
 
             State::RECORDING => {
+                // Print details about the fetch result for debugging
+                //print_fetch_result(res);
+
                 // Check VAD state
                 let vad_state = unsafe { (*res).vad_state };
 
@@ -236,6 +297,11 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                         if let Some(mut writer) = wav_writer.take() {
                             log::info!("Finalizing WAV file after {} silent frames", silence_frames);
                             writer.finalize()?;
+
+                            // Flush the filesystem to ensure all data is written
+                            if let Err(e) = flush_filesystem("/vfat") {
+                                log::warn!("Failed to flush filesystem: {}", e);
+                            }
                         }
 
                         // Return to wake word detection
@@ -262,6 +328,72 @@ extern "C" fn fetch_proc(arg: * mut std::ffi::c_void) {
     let res = inner_fetch_proc(&feed_arg);
 }
 
+// Add this function to print all fields of afe_config
+fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
+    unsafe {
+        log::info!("--- AFE Configuration ---");
+
+        // AEC configuration
+        log::info!("AEC: init={}, mode={}, filter_length={}",
+            (*afe_config).aec_init,
+            (*afe_config).aec_mode,
+            (*afe_config).aec_filter_length);
+
+        // SE configuration
+        log::info!("SE: init={}", (*afe_config).se_init);
+
+        // NS configuration
+        log::info!("NS: init={}, mode={}",
+            (*afe_config).ns_init,
+            (*afe_config).afe_ns_mode);
+
+        // VAD configuration
+        log::info!("VAD: init={}, mode={}, min_speech_ms={}, min_noise_ms={}, delay_ms={}, mute_playback={}, enable_channel_trigger={}",
+            (*afe_config).vad_init,
+            (*afe_config).vad_mode,
+            (*afe_config).vad_min_speech_ms,
+            (*afe_config).vad_min_noise_ms,
+            (*afe_config).vad_delay_ms,
+            (*afe_config).vad_mute_playback,
+            (*afe_config).vad_enable_channel_trigger);
+
+        // WakeNet configuration
+        log::info!("WakeNet: init={}, mode={}",
+            (*afe_config).wakenet_init,
+            (*afe_config).wakenet_mode);
+
+        // AGC configuration
+        log::info!("AGC: init={}, mode={}, compression_gain_db={}, target_level_dbfs={}",
+            (*afe_config).agc_init,
+            (*afe_config).agc_mode,
+            (*afe_config).agc_compression_gain_db,
+            (*afe_config).agc_target_level_dbfs);
+
+        // PCM configuration
+        log::info!("PCM: total_ch_num={}, mic_num={}, ref_num={}, sample_rate={}",
+            (*afe_config).pcm_config.total_ch_num,
+            (*afe_config).pcm_config.mic_num,
+            (*afe_config).pcm_config.ref_num,
+            (*afe_config).pcm_config.sample_rate);
+
+        // General AFE configuration
+        log::info!("General AFE: mode={}, type={}, preferred_core={}, preferred_priority={}, ringbuf_size={}, linear_gain={}",
+            (*afe_config).afe_mode,
+            (*afe_config).afe_type,
+            (*afe_config).afe_perferred_core,
+            (*afe_config).afe_perferred_priority,
+            (*afe_config).afe_ringbuf_size,
+            (*afe_config).afe_linear_gain);
+
+        log::info!("Memory allocation mode={}, debug_init={}, fixed_first_channel={}",
+            (*afe_config).memory_alloc_mode,
+            (*afe_config).debug_init,
+            (*afe_config).fixed_first_channel);
+
+        log::info!("--- End of AFE Configuration ---");
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
@@ -270,8 +402,8 @@ fn main() -> anyhow::Result<()> {
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    //let mut sd = sd_card::SdCard::new("/vfat");
-    //sd.mount_spi()?;
+    let mut sd = sd_card::SdCard::new("/vfat");
+    sd.mount_spi()?;
 
     let part_name = CString::new("model").unwrap();
     let models = unsafe { esp_srmodel_init(part_name.as_ptr()) };
@@ -285,6 +417,9 @@ fn main() -> anyhow::Result<()> {
             esp_sr::afe_mode_t_AFE_MODE_LOW_COST,
         )
     };
+
+    // Print the AFE configuration
+    print_afe_config(afe_config);
 
     let afe_handle = unsafe { esp_afe_handle_from_config(afe_config) };
     let afe_data = call_c_method!(afe_handle, create_from_config, afe_config)?;
@@ -341,6 +476,9 @@ fn main() -> anyhow::Result<()> {
     // Clean up resources
     let _ = call_c_method!(multinet, destroy, model_data);
     let _ = call_c_method!(afe_handle, destroy, afe_data);
+
+    // Flush filesystem before exit
+    let _ = flush_filesystem("/vfat");
 
     Ok(())
 }
