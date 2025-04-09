@@ -86,7 +86,6 @@ macro_rules! call_c_method {
 }
 
 fn inner_feed_proc(feed_arg: &Box<FeedTaskArg>) -> anyhow::Result<()> {
-
     let peripherals = Peripherals::take()?;
     let mut mic = init_mic(
         peripherals.i2s0,
@@ -116,40 +115,140 @@ extern "C" fn feed_proc(arg: * mut std::ffi::c_void) {
     inner_feed_proc(&feed_arg).unwrap();
 }
 
+// Define the State enum
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum State {
+    WAKE_WORD_DETECTING,
+    CMD_DETECTING,
+    RECORDING,
+}
+
 fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     let afe_handle = arg.afe_handle;
     let afe_data = arg.afe_data;
     let multinet = arg.multinet;
     let model_data = arg.model_data;
 
-    let mut detect_flag: bool = false;
-    log::info!("Starting detection loop");
+    // Initialize state
+    let mut state = State::WAKE_WORD_DETECTING;
+
+    // For recording WAV files
+    let mut file_idx = 0;
+    let mut wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>> = None;
+
+    // For tracking silence duration
+    let mut silence_frames = 0;
+    let frames_per_second = 16000 / 480; // Assuming 30ms frames at 16kHz (adjust based on your frame size)
+
+    log::info!("Starting detection loop with initial state: {:?}", state);
+
     loop {
+        // Always fetch data from AFE
         let res = call_c_method!(afe_handle, fetch, afe_data)?;
         if res.is_null() || unsafe { (*res).ret_value } == esp_sr::ESP_FAIL {
             log::error!("Fetch error!");
             break;
         }
 
-        if unsafe { (*res).wakeup_state } == esp_sr::wakenet_state_t_WAKENET_DETECTED {
-            log::info!("Wakeword detected");
-            call_c_method!(afe_handle, disable_wakenet, afe_data)?;
-            call_c_method!(multinet, clean, model_data)?;
-            detect_flag = true;
-        }
+        // Handle the data based on current state
+        match state {
+            State::WAKE_WORD_DETECTING => {
+                if unsafe { (*res).wakeup_state } == esp_sr::wakenet_state_t_WAKENET_DETECTED {
+                    let next_state = State::CMD_DETECTING;
+                    log::info!("Wake word detected. State transition: {:?} -> {:?}", state, next_state);
 
-        if detect_flag {
-            let mn_state = call_c_method!(multinet, detect, model_data, (*res).data)?;
-            if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_DETECTED {
-                let mn_result = call_c_method!(multinet, get_results, model_data)?;
-                for i in 0..unsafe { (*mn_result).num as usize } {
-                    let command_id = unsafe { (*mn_result).command_id[i] };
-                    log::info!("Command detected: {}", command_id);
+                    call_c_method!(afe_handle, disable_wakenet, afe_data)?;
+                    call_c_method!(multinet, clean, model_data)?;
+                    state = next_state;
                 }
-            } else if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_TIMEOUT {
-                log::info!("Timeout, no command detected");
-                call_c_method!(afe_handle, enable_wakenet, afe_data)?;
-                detect_flag = false;
+            },
+
+            State::CMD_DETECTING => {
+                let mn_state = call_c_method!(multinet, detect, model_data, (*res).data)?;
+                if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_DETECTED {
+                    let mn_result = call_c_method!(multinet, get_results, model_data)?;
+                    let command_id_str = (0..unsafe { (*mn_result).num as usize })
+                        .map(|i| unsafe { (*mn_result).command_id[i].to_string() })
+                        .collect::<Vec<String>>()
+                        .join(", ");
+
+                    for i in 0..unsafe { (*mn_result).num as usize } {
+                        let command_id = unsafe { (*mn_result).command_id[i] };
+                        log::info!("Command detected: {}", command_id);
+                    }
+
+                    let next_state = State::RECORDING;
+                    log::info!("Command detected (ID: {}). State transition: {:?} -> {:?}",
+                        command_id_str, state, next_state);
+
+                    // Initialize WAV recording
+                    let spec = WavSpec {
+                        channels: 1,
+                        sample_rate: 16000,
+                        bits_per_sample: 16,
+                        sample_format: hound::SampleFormat::Int,
+                    };
+
+                    // Increment file_idx before creating the writer to avoid conflicts if finalization fails
+                    let current_file_idx = file_idx;
+                    file_idx += 1;
+
+                    log::info!("Creating WAV file: /vfat/audio{}.wav", current_file_idx);
+                    let writer = WavWriter::create(std::format!("/vfat/audio{}.wav", current_file_idx), spec)?;
+                    wav_writer = Some(writer);
+                    silence_frames = 0;
+
+                    state = next_state;
+
+                } else if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_TIMEOUT {
+                    let next_state = State::WAKE_WORD_DETECTING;
+                    log::info!("Command detection timeout. State transition: {:?} -> {:?}", state, next_state);
+
+                    call_c_method!(afe_handle, enable_wakenet, afe_data)?;
+                    state = next_state;
+                }
+            },
+
+            State::RECORDING => {
+                // Check VAD state
+                let vad_state = unsafe { (*res).vad_state };
+
+                // Write audio data to WAV file
+                if let Some(writer) = &mut wav_writer {
+                    let data_ptr = unsafe { (*res).data };
+                    let data_size = unsafe { (*res).data_size / 2 }; // Convert bytes to samples (16-bit samples)
+
+                    // Assuming data is an array of i16 samples
+                    for i in 0..data_size {
+                        let sample = unsafe { *data_ptr.offset(i as isize) };
+                        writer.write_sample(sample)?;
+                    }
+                }
+
+                if vad_state == sys::esp_sr::vad_state_t_VAD_SILENCE {
+                    silence_frames += 1;
+                    if silence_frames >= frames_per_second { // More than 1 second of silence
+                        let next_state = State::WAKE_WORD_DETECTING;
+                        log::info!("Detected {} frames of silence. State transition: {:?} -> {:?}",
+                            silence_frames, state, next_state);
+
+                        // Finalize WAV file
+                        if let Some(mut writer) = wav_writer.take() {
+                            log::info!("Finalizing WAV file after {} silent frames", silence_frames);
+                            writer.finalize()?;
+                        }
+
+                        // Return to wake word detection
+                        call_c_method!(afe_handle, enable_wakenet, afe_data)?;
+                        state = next_state;
+                    }
+                } else {
+                    // Reset silence counter when we detect speech
+                    if silence_frames > 0 {
+                        log::debug!("Speech detected after {} silent frames, resetting silence counter", silence_frames);
+                    }
+                    silence_frames = 0;
+                }
             }
         }
     }
