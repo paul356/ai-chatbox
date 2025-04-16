@@ -1,16 +1,16 @@
 use anyhow;
 use esp_idf_svc::hal::{
     self,
-    gpio::{InputPin, OutputPin},
+    gpio::{Gpio41, Gpio42, InputPin, OutputPin},
     i2s::{
         config::{
             ClockSource, Config, DataBitWidth, MclkMultiple, PdmDownsample, PdmRxClkConfig,
             PdmRxConfig, PdmRxGpioConfig, PdmRxSlotConfig, SlotMode,
         },
-        I2s, I2sDriver, I2sRx,
+        I2s, I2sDriver, I2sRx, I2S0,
     },
     peripheral::Peripheral,
-    peripherals::{self, Peripherals},
+    peripherals::Peripherals,
 };
 use esp_idf_svc::{
     sys,
@@ -37,11 +37,16 @@ mod llm_intf;
 
 use llm_intf::{LlmHelper, ChatRole};
 
+// Update FeedTaskArg to include the peripherals needed for the microphone
 struct FeedTaskArg {
     afe_handle: *mut esp_sr::esp_afe_sr_iface_t,
     afe_data: *mut esp_sr::esp_afe_sr_data_t,
     multinet: *mut esp_sr::esp_mn_iface_t,
     model_data: *mut esp_sr::model_iface_data_t,
+    // Add fields for the peripherals needed for the microphone
+    i2s0: I2S0,
+    gpio_clk: Gpio42,
+    gpio_din: Gpio41,
 }
 
 struct FetchTaskArg {
@@ -94,16 +99,16 @@ macro_rules! call_c_method {
     };
 }
 
-fn inner_feed_proc(feed_arg: &Box<FeedTaskArg>) -> anyhow::Result<()> {
-    let peripherals = Peripherals::take()?;
+// Modify inner_feed_proc to use peripherals from FeedTaskArg
+fn inner_feed_proc(feed_arg: &mut Box<FeedTaskArg>) -> anyhow::Result<()> {
+    // Get peripherals from the FeedTaskArg
     let mut mic = init_mic(
-        peripherals.i2s0,
-        peripherals.pins.gpio42,
-        peripherals.pins.gpio41,
+        &mut feed_arg.i2s0,
+        &mut feed_arg.gpio_clk,
+        &mut feed_arg.gpio_din,
     )?;
 
     let chunk_size = call_c_method!(feed_arg.afe_handle, get_feed_chunksize, feed_arg.afe_data)?;
-
     let channel_num = call_c_method!(feed_arg.afe_handle, get_feed_channel_num, feed_arg.afe_data)?;
 
     log::info!("[INFO] chunk_size {}, channel_num {}", chunk_size, channel_num);
@@ -119,9 +124,9 @@ fn inner_feed_proc(feed_arg: &Box<FeedTaskArg>) -> anyhow::Result<()> {
 }
 
 extern "C" fn feed_proc(arg: * mut std::ffi::c_void) {
-    let feed_arg = unsafe { Box::from_raw(arg as *mut FeedTaskArg) };
+    let mut feed_arg = unsafe { Box::from_raw(arg as *mut FeedTaskArg) };
 
-    match inner_feed_proc(&feed_arg) {
+    match inner_feed_proc(&mut feed_arg) {
         Ok(_) => log::info!("Feed task completed successfully"),
         Err(e) => log::error!("Feed task failed: {}", e),
     };
@@ -166,16 +171,15 @@ fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
     std::fs::remove_file(&flush_path)?;
 
     // On ESP-IDF, we can also directly call the esp_vfs_fat_sdmmc_unmount function
-    // But we need to use the unsafe FFI call
-    unsafe {
-        #[allow(non_snake_case)]
-        extern "C" {
-            fn esp_vfs_fat_sdcard_unmount(mount_point: *const std::os::raw::c_char, card: *mut std::os::raw::c_void) -> i32;
-        }
+    #[allow(non_snake_case)]
+    extern "C" {
+        fn esp_vfs_fat_sdcard_unmount(mount_point: *const std::os::raw::c_char, card: *mut std::os::raw::c_void) -> i32;
+    }
 
-        // This is a more aggressive approach - unmount and remount
-        // Only use if the above sync_all approach doesn't work
-        /*
+    // This is a more aggressive approach - unmount and remount
+    // Only use if the above sync_all approach doesn't work
+    /*
+    unsafe {
         let c_mount_point = CString::new(mount_point)?;
         let result = esp_vfs_fat_sdcard_unmount(c_mount_point.as_ptr(), std::ptr::null_mut());
         if result != 0 {
@@ -185,8 +189,8 @@ fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
         // Remount the card
         let mut sd = sd_card::SdCard::new(mount_point);
         sd.mount_spi()?;
-        */
     }
+    */
 
     log::info!("Filesystem at {} flushed successfully", mount_point);
     Ok(())
@@ -215,6 +219,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     loop {
         // Always fetch data from AFE
         let res = call_c_method!(afe_handle, fetch, afe_data)?;
+
         if res.is_null() || unsafe { (*res).ret_value } == esp_sr::ESP_FAIL {
             log::error!("Fetch error!");
             break;
@@ -412,9 +417,9 @@ fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
 
 // Update WiFi initialization function
 fn initialize_wifi() -> anyhow::Result<()> {
-    // Get SSID and password from compile-time environment variables
-    let ssid = env!("WIFI_SSID");
-    let pass = env!("WIFI_PASS");
+    // Get SSID and password from environment variables at compile time
+    let ssid = env!("WIFI_SSID", "WiFi SSID must be set at compile time");
+    let pass = env!("WIFI_PASS", "WiFi password must be set at compile time");
 
     log::info!("Connecting to WiFi network: {}", ssid);
 
@@ -464,7 +469,8 @@ fn initialize_wifi() -> anyhow::Result<()> {
 
 // Test function for LLM functionality
 fn test_llm_helper() -> anyhow::Result<()> {
-    let token = env!("LLM_AUTH_TOKEN");
+    // Get token from environment variable at compile time
+    let token = env!("LLM_AUTH_TOKEN", "LLM authentication token must be set at compile time");
 
     log::info!("Creating LlmHelper instance to test DeepSeek API integration");
     let mut llm = llm_intf::LlmHelper::new(token, "deepseek-chat");
@@ -501,7 +507,10 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("Starting AI Chatbox application");
 
-    // Connect to Wi-Fi using compile-time environment variables
+    // Take peripherals once at the beginning
+    let peripherals = Peripherals::take()?;
+
+    // Connect to Wi-Fi
     match initialize_wifi() {
         Ok(_) => log::info!("WiFi connected successfully"),
         Err(e) => log::error!("Failed to connect to WiFi: {}", e),
@@ -563,6 +572,9 @@ fn main() -> anyhow::Result<()> {
         afe_data,
         multinet,
         model_data,
+        i2s0: peripherals.i2s0,
+        gpio_clk: peripherals.pins.gpio42,
+        gpio_din: peripherals.pins.gpio41,
     });
 
     let _ = unsafe {
