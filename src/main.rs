@@ -121,7 +121,10 @@ fn inner_feed_proc(feed_arg: &Box<FeedTaskArg>) -> anyhow::Result<()> {
 extern "C" fn feed_proc(arg: * mut std::ffi::c_void) {
     let feed_arg = unsafe { Box::from_raw(arg as *mut FeedTaskArg) };
 
-    inner_feed_proc(&feed_arg).unwrap();
+    match inner_feed_proc(&feed_arg) {
+        Ok(_) => log::info!("Feed task completed successfully"),
+        Err(e) => log::error!("Feed task failed: {}", e),
+    };
 }
 
 // Define the State enum
@@ -335,6 +338,10 @@ extern "C" fn fetch_proc(arg: * mut std::ffi::c_void) {
     let feed_arg = unsafe { Box::from_raw(arg as *mut FetchTaskArg) };
 
     let res = inner_fetch_proc(&feed_arg);
+    match res {
+        Ok(_) => log::info!("Fetch task completed successfully"),
+        Err(e) => log::error!("Fetch task failed: {}", e),
+    };
 }
 
 // Add this function to print all fields of afe_config
