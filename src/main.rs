@@ -27,6 +27,9 @@ use sys::esp_sr::{
 use sys::{configTICK_RATE_HZ, vTaskDelay};
 
 mod sd_card;
+mod llm_intf;
+
+use llm_intf::{LlmHelper, ChatRole};
 
 struct FeedTaskArg {
     afe_handle: *mut esp_sr::esp_afe_sr_iface_t,
@@ -180,7 +183,7 @@ fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Modify the RECORDING state code to flush data after finalizing WAV file
+// Modify the RECORDING state code to process audio with LLM after finalizing WAV file
 fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     let afe_handle = arg.afe_handle;
     let afe_data = arg.afe_data;
@@ -193,10 +196,16 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     // For recording WAV files
     let mut file_idx = 0;
     let mut wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>> = None;
+    let mut current_wav_path = String::new();
 
     // For tracking silence duration
     let mut silence_frames = 0;
     let frames_per_second = 16000 / 480; // Assuming 30ms frames at 16kHz (adjust based on your frame size)
+
+    // Initialize LLM helper for processing audio commands
+    // Replace "your_api_token" with the actual DeepSeek API token
+    let mut llm_helper = LlmHelper::new("your_api_token", "deepseek-chat");
+    llm_helper.configure(Some(1024), Some(0.7), Some(0.9));
 
     log::info!("Starting detection loop with initial state: {:?}", state);
 
@@ -251,8 +260,9 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                     let current_file_idx = file_idx;
                     file_idx += 1;
 
-                    log::info!("Creating WAV file: /vfat/audio{}.wav", current_file_idx);
-                    let writer = WavWriter::create(std::format!("/vfat/audio{}.wav", current_file_idx), spec)?;
+                    current_wav_path = std::format!("/vfat/audio{}.wav", current_file_idx);
+                    log::info!("Creating WAV file: {}", current_wav_path);
+                    let writer = WavWriter::create(&current_wav_path, spec)?;
                     wav_writer = Some(writer);
                     silence_frames = 0;
 
@@ -301,6 +311,23 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                             // Flush the filesystem to ensure all data is written
                             if let Err(e) = flush_filesystem("/vfat") {
                                 log::warn!("Failed to flush filesystem: {}", e);
+                            }
+                            
+                            // Send audio file info to LLM for processing
+                            let audio_message = format!("I've recorded an audio file: {}. This recording was triggered by voice command detection.", current_wav_path);
+                            log::info!("Sending audio file info to LLM for analysis");
+                            
+                            // This is where we would ideally transcribe the audio first
+                            // For now, we just send information about the recording
+                            match std::panic::catch_unwind(|| {
+                                llm_helper.send_message(audio_message, ChatRole::User)
+                            }) {
+                                Ok(llm_response) => {
+                                    log::info!("LLM response: {}", llm_response);
+                                },
+                                Err(_) => {
+                                    log::error!("Failed to get response from LLM");
+                                }
                             }
                         }
 
