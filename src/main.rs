@@ -12,13 +12,19 @@ use esp_idf_svc::hal::{
     peripheral::Peripheral,
     peripherals::{self, Peripherals},
 };
-use esp_idf_svc::sys;
+use esp_idf_svc::{
+    sys,
+    wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi},
+    nvs::EspDefaultNvsPartition,
+    eventloop::EspSystemEventLoop,
+};
 use hound::{
     WavWriter,
     WavSpec,
 };
-use std::{ffi::CString, os::raw::c_void};
-use std::boxed;
+use heapless;
+use std::{ffi::CString, os::raw::c_void, time::Duration};
+use std::sync::Arc;
 use sys::esp_sr::{
     self, afe_config_free, afe_config_init, esp_afe_handle_from_config, esp_mn_commands_add,
     esp_mn_commands_clear, esp_mn_commands_update, esp_mn_handle_from_name, esp_srmodel_filter,
@@ -202,9 +208,10 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     let mut silence_frames = 0;
     let frames_per_second = 16000 / 480; // Assuming 30ms frames at 16kHz (adjust based on your frame size)
 
-    // Initialize LLM helper for processing audio commands
-    // Replace "your_api_token" with the actual DeepSeek API token
-    let mut llm_helper = LlmHelper::new("your_api_token", "deepseek-chat");
+    // Initialize LLM helper for processing audio commands with API token from compile-time env var
+    let token = env!("LLM_AUTH_TOKEN");
+    log::info!("Initializing LLM helper for audio processing");
+    let mut llm_helper = LlmHelper::new(token, "deepseek-chat");
     llm_helper.configure(Some(1024), Some(0.7), Some(0.9));
 
     log::info!("Starting detection loop with initial state: {:?}", state);
@@ -312,21 +319,15 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                             if let Err(e) = flush_filesystem("/vfat") {
                                 log::warn!("Failed to flush filesystem: {}", e);
                             }
-                            
+
                             // Send audio file info to LLM for processing
                             let audio_message = format!("I've recorded an audio file: {}. This recording was triggered by voice command detection.", current_wav_path);
                             log::info!("Sending audio file info to LLM for analysis");
-                            
-                            // This is where we would ideally transcribe the audio first
-                            // For now, we just send information about the recording
-                            match std::panic::catch_unwind(|| {
-                                llm_helper.send_message(audio_message, ChatRole::User)
-                            }) {
-                                Ok(llm_response) => {
-                                    log::info!("LLM response: {}", llm_response);
-                                },
-                                Err(_) => {
-                                    log::error!("Failed to get response from LLM");
+
+                            // Use a safer approach without catch_unwind, since LlmHelper isn't UnwindSafe
+                            match llm_helper.send_message(audio_message, ChatRole::User) {
+                                response => {
+                                    log::info!("LLM response: {}", response);
                                 }
                             }
                         }
@@ -421,6 +422,87 @@ fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
     }
 }
 
+// Update WiFi initialization function
+fn initialize_wifi() -> anyhow::Result<()> {
+    // Get SSID and password from compile-time environment variables
+    let ssid = env!("WIFI_SSID");
+    let pass = env!("WIFI_PASS");
+
+    log::info!("Connecting to WiFi network: {}", ssid);
+
+    let sys_loop = EspSystemEventLoop::take()?;
+    let nvs = EspDefaultNvsPartition::take()?;
+    let peripherals = Peripherals::take()?;
+
+    let mut wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?;
+
+    let mut auth_method = AuthMethod::WPA2Personal;
+    if pass.is_empty() {
+        auth_method = AuthMethod::None;
+    }
+
+    let mut client_config = ClientConfiguration {
+        ssid: heapless::String::new(),
+        password: heapless::String::new(),
+        auth_method,
+        ..Default::default()
+    };
+
+    // Copy SSID and password into heapless Strings
+    client_config.ssid.push_str(ssid).map_err(|_| anyhow::anyhow!("SSID too long"))?;
+    client_config.password.push_str(pass).map_err(|_| anyhow::anyhow!("Password too long"))?;
+
+    wifi.set_configuration(&Configuration::Client(client_config))?;
+
+    wifi.start()?;
+    log::info!("WiFi started, connecting...");
+
+    wifi.connect()?;
+    log::info!("Waiting for connection...");
+
+    // Give it some time to connect
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    if wifi.is_connected()? {
+        log::info!("WiFi connected successfully!");
+        let ip_info = wifi.sta_netif().get_ip_info()?;
+        log::info!("IP info: {:?}", ip_info);
+    } else {
+        log::warn!("WiFi not connected after timeout!");
+    }
+
+    Ok(())
+}
+
+// Test function for LLM functionality
+fn test_llm_helper() -> anyhow::Result<()> {
+    let token = env!("LLM_AUTH_TOKEN");
+
+    log::info!("Creating LlmHelper instance to test DeepSeek API integration");
+    let mut llm = llm_intf::LlmHelper::new(token, "deepseek-chat");
+
+    // Configure parameters
+    llm.configure(Some(256), Some(0.7), Some(0.9));
+
+    // Send a test message
+    log::info!("Sending test message to DeepSeek API");
+    let response = llm.send_message(
+        "Hello! I'm testing the ESP32-S3 integration with DeepSeek AI. Can you confirm this is working?".to_string(),
+        llm_intf::ChatRole::User
+    );
+
+    log::info!("Received response from DeepSeek API: {}", response);
+
+    // Get conversation history
+    let history = llm.get_history();
+    log::info!("Conversation history:");
+    for msg in history {
+        log::info!("  {}", msg);
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
@@ -428,6 +510,20 @@ fn main() -> anyhow::Result<()> {
 
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
+
+    log::info!("Starting AI Chatbox application");
+
+    // Connect to Wi-Fi using compile-time environment variables
+    match initialize_wifi() {
+        Ok(_) => log::info!("WiFi connected successfully"),
+        Err(e) => log::error!("Failed to connect to WiFi: {}", e),
+    }
+
+    // Test the LLM helper
+    match test_llm_helper() {
+        Ok(_) => log::info!("LLM test completed successfully"),
+        Err(e) => log::error!("LLM test failed: {}", e),
+    }
 
     let mut sd = sd_card::SdCard::new("/vfat");
     sd.mount_spi()?;
