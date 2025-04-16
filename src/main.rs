@@ -23,26 +23,23 @@ use hound::{
     WavSpec,
 };
 use heapless;
-use std::{ffi::CString, os::raw::c_void, time::Duration};
-use std::sync::Arc;
+use std::{ffi::CString, os::raw::c_void};
 use sys::esp_sr::{
     self, afe_config_free, afe_config_init, esp_afe_handle_from_config, esp_mn_commands_add,
     esp_mn_commands_clear, esp_mn_commands_update, esp_mn_handle_from_name, esp_srmodel_filter,
-    esp_srmodel_init, esp_afe_sr_iface_t, esp_afe_sr_data_t, esp_mn_iface_t, model_iface_data_t
+    esp_srmodel_init
 };
-use sys::{configTICK_RATE_HZ, vTaskDelay};
 
 mod sd_card;
 mod llm_intf;
 
+#[allow(unused_imports)]
 use llm_intf::{LlmHelper, ChatRole};
 
-// Update FeedTaskArg to include the peripherals needed for the microphone
+// Update FeedTaskArg to include only the necessary peripherals needed for the microphone
 struct FeedTaskArg {
     afe_handle: *mut esp_sr::esp_afe_sr_iface_t,
     afe_data: *mut esp_sr::esp_afe_sr_data_t,
-    multinet: *mut esp_sr::esp_mn_iface_t,
-    model_data: *mut esp_sr::model_iface_data_t,
     // Add fields for the peripherals needed for the microphone
     i2s0: I2S0,
     gpio_clk: Gpio42,
@@ -119,8 +116,6 @@ fn inner_feed_proc(feed_arg: &mut Box<FeedTaskArg>) -> anyhow::Result<()> {
         mic.read(chunk.as_mut_slice(), 100)?;
         let _ = call_c_method!(feed_arg.afe_handle, feed, feed_arg.afe_data, chunk.as_ptr() as *const i16)?;
     }
-
-    Ok(())
 }
 
 extern "C" fn feed_proc(arg: * mut std::ffi::c_void) {
@@ -135,12 +130,12 @@ extern "C" fn feed_proc(arg: * mut std::ffi::c_void) {
 // Define the State enum
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
-    WAKE_WORD_DETECTING,
-    CMD_DETECTING,
-    RECORDING,
+    WakeWordDetecting,
+    CmdDetecting,
+    Recording,
 }
 
-// Add a function to print afe_fetch_result_t fields
+#[allow(dead_code)]
 fn print_fetch_result(res: *const esp_sr::afe_fetch_result_t) {
     unsafe {
         log::info!("--- AFE Fetch Result ---");
@@ -170,6 +165,7 @@ fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
     // Remove the temporary file
     std::fs::remove_file(&flush_path)?;
 
+    /*
     // On ESP-IDF, we can also directly call the esp_vfs_fat_sdmmc_unmount function
     #[allow(non_snake_case)]
     extern "C" {
@@ -178,7 +174,6 @@ fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
 
     // This is a more aggressive approach - unmount and remount
     // Only use if the above sync_all approach doesn't work
-    /*
     unsafe {
         let c_mount_point = CString::new(mount_point)?;
         let result = esp_vfs_fat_sdcard_unmount(c_mount_point.as_ptr(), std::ptr::null_mut());
@@ -204,7 +199,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     let model_data = arg.model_data;
 
     // Initialize state
-    let mut state = State::WAKE_WORD_DETECTING;
+    let mut state = State::WakeWordDetecting;
 
     // For recording WAV files
     let mut file_idx = 0;
@@ -227,9 +222,9 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
 
         // Handle the data based on current state
         match state {
-            State::WAKE_WORD_DETECTING => {
+            State::WakeWordDetecting => {
                 if unsafe { (*res).wakeup_state } == esp_sr::wakenet_state_t_WAKENET_DETECTED {
-                    let next_state = State::CMD_DETECTING;
+                    let next_state = State::CmdDetecting;
                     log::info!("Wake word detected. State transition: {:?} -> {:?}", state, next_state);
 
                     call_c_method!(afe_handle, disable_wakenet, afe_data)?;
@@ -238,7 +233,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                 }
             },
 
-            State::CMD_DETECTING => {
+            State::CmdDetecting => {
                 let mn_state = call_c_method!(multinet, detect, model_data, (*res).data)?;
                 if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_DETECTED {
                     let mn_result = call_c_method!(multinet, get_results, model_data)?;
@@ -252,7 +247,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                         log::info!("Command detected: {}", command_id);
                     }
 
-                    let next_state = State::RECORDING;
+                    let next_state = State::Recording;
                     log::info!("Command detected (ID: {}). State transition: {:?} -> {:?}",
                         command_id_str, state, next_state);
 
@@ -276,7 +271,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                     state = next_state;
 
                 } else if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_TIMEOUT {
-                    let next_state = State::WAKE_WORD_DETECTING;
+                    let next_state = State::WakeWordDetecting;
                     log::info!("Command detection timeout. State transition: {:?} -> {:?}", state, next_state);
 
                     call_c_method!(afe_handle, enable_wakenet, afe_data)?;
@@ -284,7 +279,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                 }
             },
 
-            State::RECORDING => {
+            State::Recording => {
                 // Print details about the fetch result for debugging
                 //print_fetch_result(res);
 
@@ -306,12 +301,12 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                 if vad_state == sys::esp_sr::vad_state_t_VAD_SILENCE {
                     silence_frames += 1;
                     if silence_frames >= frames_per_second { // More than 1 second of silence
-                        let next_state = State::WAKE_WORD_DETECTING;
+                        let next_state = State::WakeWordDetecting;
                         log::info!("Detected {} frames of silence. State transition: {:?} -> {:?}",
                             silence_frames, state, next_state);
 
                         // Finalize WAV file
-                        if let Some(mut writer) = wav_writer.take() {
+                        if let Some(writer) = wav_writer.take() {
                             log::info!("Finalizing WAV file after {} silent frames", silence_frames);
                             writer.finalize()?;
 
@@ -545,9 +540,6 @@ fn main() -> anyhow::Result<()> {
     let afe_data = call_c_method!(afe_handle, create_from_config, afe_config)?;
     unsafe { afe_config_free(afe_config) };
 
-    //let multinet: *mut esp_sr::esp_mn_iface_t = std::ptr::null_mut();
-    //let model_data: *mut esp_sr::model_iface_data_t = std::ptr::null_mut();
-
     let prefix_str = Vec::from(esp_sr::ESP_MN_PREFIX);
     let chinese_str = Vec::from(esp_sr::ESP_MN_CHINESE);
     let mn_name = unsafe {
@@ -570,8 +562,6 @@ fn main() -> anyhow::Result<()> {
     let feed_task_arg = Box::new(FeedTaskArg {
         afe_handle,
         afe_data,
-        multinet,
-        model_data,
         i2s0: peripherals.i2s0,
         gpio_clk: peripherals.pins.gpio42,
         gpio_din: peripherals.pins.gpio41,
@@ -592,16 +582,17 @@ fn main() -> anyhow::Result<()> {
         hal::task::create(fetch_proc, &*CString::new("fetch_task").unwrap(), 8 * 1024, Box::into_raw(fetch_task_arg) as *mut c_void, 5, None)
     }?;
 
+    // Main loop will never exit, so we don't need cleanup code
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
-    // Clean up resources
-    let _ = call_c_method!(multinet, destroy, model_data);
-    let _ = call_c_method!(afe_handle, destroy, afe_data);
-
-    // Flush filesystem before exit
-    let _ = flush_filesystem("/vfat");
-
-    Ok(())
+    // NOTE: The following cleanup code is unreachable in the current design
+    // If you need cleanup to run, consider using a signal handler or other approach
+    // #[allow(unreachable_code)]
+    // {
+    //     let _ = call_c_method!(multinet, destroy, model_data);
+    //     let _ = call_c_method!(afe_handle, destroy, afe_data);
+    //     let _ = flush_filesystem("/vfat");
+    // }
 }

@@ -16,13 +16,19 @@ use esp_idf_svc::sys::{
 };
 use esp_idf_svc::sys;
 
+#[allow(dead_code)]
 const SDMMC_SLOT_FLAG_INTERNAL_PULLUP: c_uint = 1 << 0;
+#[allow(dead_code)]
 const SDMMC_HOST_FLAG_1BIT: c_uint = 1 << 0;
+#[allow(dead_code)]
 const SDMMC_HOST_FLAG_4BIT: c_uint = 1 << 1;
+#[allow(dead_code)]
 const SDMMC_HOST_FLAG_8BIT: c_uint = 1 << 2;
 const SDMMC_HOST_FLAG_SPI: c_uint = 1 << 3;
+#[allow(dead_code)]
 const SDMMC_HOST_FLAG_DDR: c_uint = 1 << 4;
 const SDMMC_HOST_FLAG_DEINIT_ARG: c_uint = 1 << 5;
+#[allow(dead_code)]
 const SDMMC_HOST_SLOT_1: i32 = 1;
 const SDMMC_FREQ_DEFAULT: i32 = 20000;
 const SDMMC_DELAY_PHASE_0: u32 = 0;
@@ -45,6 +51,7 @@ impl SdCard {
         }
     }
 
+    #[allow(dead_code)]
     pub fn mount_sdmmc(&mut self) -> anyhow::Result<()> {
         let sdmmc_mount_config = esp_vfs_fat_sdmmc_mount_config_t {
             format_if_mount_failed: false,

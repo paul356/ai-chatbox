@@ -61,17 +61,23 @@ struct ResponseFormat {
 /// Response structure from the DeepSeek API
 #[derive(Debug, Deserialize)]
 struct DeepSeekResponse {
+    #[allow(dead_code)]
     id: String,
     choices: Vec<Choice>,
+    #[allow(dead_code)]
     created: u64,
+    #[allow(dead_code)]
     model: String,
+    #[allow(dead_code)]
     object: String,
     usage: Usage,
 }
 
 #[derive(Debug, Deserialize)]
 struct Choice {
+    #[allow(dead_code)]
     finish_reason: String,
+    #[allow(dead_code)]
     index: u32,
     message: ChatMessage,
 }
@@ -129,6 +135,7 @@ impl LlmHelper {
     }
     
     /// Clear the message history, keeping only the system message
+    #[allow(dead_code)]
     pub fn clear_history(&mut self) {
         if !self.message_history.is_empty() {
             // Preserve system message if it exists
