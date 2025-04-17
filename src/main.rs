@@ -459,7 +459,7 @@ fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
 }
 
 // Enhanced WiFi initialization function with better error handling and reconnection logic
-fn initialize_wifi() -> anyhow::Result<()> {
+fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<()> {
     // Get SSID and password from environment variables at compile time
     let ssid = env!("WIFI_SSID", "WiFi SSID must be set at compile time");
     let pass = env!("WIFI_PASS", "WiFi password must be set at compile time");
@@ -468,9 +468,8 @@ fn initialize_wifi() -> anyhow::Result<()> {
 
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
-    let peripherals = Peripherals::take()?;
 
-    let mut wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?;
+    let mut wifi = EspWifi::new(modem, sys_loop.clone(), Some(nvs))?;
 
     let mut auth_method = AuthMethod::WPA2Personal;
     if pass.is_empty() {
@@ -611,7 +610,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Connect to Wi-Fi
-    match initialize_wifi() {
+    match initialize_wifi(peripherals.modem) {
         Ok(_) => log::info!("WiFi connected successfully"),
         Err(e) => log::error!("Failed to connect to WiFi: {}", e),
     }
