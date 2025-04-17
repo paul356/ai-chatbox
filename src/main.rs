@@ -151,13 +151,13 @@ impl State {
             State::Recording => "Recording audio",
         }
     }
-    
+
     /// Logs a state transition with appropriate log level
     fn log_transition(from: State, to: State, reason: &str) {
         if from == to {
             log::debug!("State remains at {:?} ({}): {}", to, to.description(), reason);
         } else {
-            log::info!("State transition: {:?} -> {:?} ({} → {}): {}", 
+            log::info!("State transition: {:?} -> {:?} ({} → {}): {}",
                       from, to, from.description(), to.description(), reason);
         }
     }
@@ -186,7 +186,7 @@ fn print_fetch_result(res: *const esp_sr::afe_fetch_result_t) {
 fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
     // Create a temporary file to force a flush of the file system
     let flush_path = format!("{}/flush.tmp", mount_point);
-    
+
     // Wrap the file operations in a separate scope to ensure file is closed before deletion
     {
         match std::fs::File::create(&flush_path) {
@@ -203,7 +203,7 @@ fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
             }
         }
     }
-    
+
     // Remove the temporary file
     match std::fs::remove_file(&flush_path) {
         Ok(_) => {
@@ -224,20 +224,20 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     let afe_data = arg.afe_data;
     let multinet = arg.multinet;
     let model_data = arg.model_data;
-    
+
     // Validate pointers before using them
     if afe_handle.is_null() {
         return Err(anyhow::anyhow!("AFE handle is null"));
     }
-    
+
     if afe_data.is_null() {
         return Err(anyhow::anyhow!("AFE data is null"));
     }
-    
+
     if multinet.is_null() {
         return Err(anyhow::anyhow!("Multinet handle is null"));
     }
-    
+
     if model_data.is_null() {
         return Err(anyhow::anyhow!("Model data is null"));
     }
@@ -265,7 +265,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(10));
             continue;
         }
-        
+
         if unsafe { (*res).ret_value } == esp_sr::ESP_FAIL {
             log::error!("Fetch failed with ESP_FAIL");
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -459,10 +459,10 @@ fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
 }
 
 // Enhanced WiFi initialization function with better error handling and reconnection logic
-fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<()> {
-    // Get SSID and password from environment variables at compile time
-    let ssid = env!("WIFI_SSID", "WiFi SSID must be set at compile time");
-    let pass = env!("WIFI_PASS", "WiFi password must be set at compile time");
+fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<Box<EspWifi<'static>>> {
+    // Get SSID and password from environment variables (mandatory)
+    let ssid = env!("WIFI_SSID", "WIFI_SSID environment variable must be set");
+    let pass = env!("WIFI_PASS", "WIFI_PASS environment variable must be set");
 
     log::info!("Connecting to WiFi network: {}", ssid);
 
@@ -496,25 +496,48 @@ fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<()> {
     // Try to connect with retries
     let max_retries = 3;
     let mut connected = false;
-    
+
     for attempt in 1..=max_retries {
         match wifi.connect() {
             Ok(_) => {
                 log::info!("WiFi connect initiated (attempt {}/{}), waiting for connection...", attempt, max_retries);
-                
+
                 // Wait for connection with timeout
-                let max_wait_seconds = 10;
-                for _ in 0..max_wait_seconds {
+                let max_wait_seconds = 15; // Increased timeout for DHCP
+                let mut has_valid_ip = false;
+
+                for i in 1..=max_wait_seconds {
                     std::thread::sleep(std::time::Duration::from_secs(1));
-                    
+
+                    // First check if connected
                     if let Ok(true) = wifi.is_connected() {
                         connected = true;
-                        break;
+
+                        // Then verify we have a valid IP address (not 0.0.0.0)
+                        if let Ok(ip_info) = wifi.sta_netif().get_ip_info() {
+                            if ip_info.ip != std::net::Ipv4Addr::new(0, 0, 0, 0) {
+                                log::info!("Valid IP address obtained: {}", ip_info.ip);
+                                log::info!("Subnet mask: {}", ip_info.subnet);
+                                log::info!("DNS: {:?}", ip_info.dns);
+
+                                // Log successful connection but don't try to test TCP connectivity
+                                has_valid_ip = true;
+                                break; // Successfully connected with valid IP
+                            } else {
+                                log::debug!("Connected but waiting for DHCP (IP: {})...", ip_info.ip);
+                            }
+                        }
                     }
                 }
-                
-                if connected {
+
+                if connected && has_valid_ip {
+                    log::info!("WiFi connected successfully with valid IP address!");
                     break;
+                } else if connected {
+                    log::warn!("Connected to WiFi but failed to get valid IP address after {} seconds", max_wait_seconds);
+                    // Disconnect and retry to force new DHCP exchange
+                    let _ = wifi.disconnect();
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                 } else {
                     log::warn!("WiFi connection timed out after {} seconds", max_wait_seconds);
                 }
@@ -532,7 +555,8 @@ fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<()> {
             Ok(ip_info) => log::info!("IP info: {:?}", ip_info),
             Err(e) => log::warn!("Failed to get IP info: {}", e),
         }
-        Ok(())
+        // Return the wifi object in a Box to maintain ownership
+        Ok(Box::new(wifi))
     } else {
         let err_msg = format!("Failed to connect to WiFi '{}' after {} attempts", ssid, max_retries);
         log::error!("{}", err_msg);
@@ -546,7 +570,7 @@ fn test_llm_helper() -> anyhow::Result<()> {
     let token = env!("LLM_AUTH_TOKEN", "LLM authentication token must be set at compile time");
 
     log::info!("Creating LlmHelper instance to test DeepSeek API integration");
-    
+
     // Create LLM helper with error handling
     let mut llm = match std::panic::catch_unwind(|| {
         llm_intf::LlmHelper::new(token, "deepseek-chat")
@@ -564,7 +588,7 @@ fn test_llm_helper() -> anyhow::Result<()> {
 
     // Send a test message
     log::info!("Sending test message to DeepSeek API");
-    
+
     let response = llm.send_message(
         "Hello! I'm testing the ESP32-S3 integration with DeepSeek AI. Can you confirm this is working?".to_string(),
         llm_intf::ChatRole::User
@@ -609,11 +633,17 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Connect to Wi-Fi
-    match initialize_wifi(peripherals.modem) {
-        Ok(_) => log::info!("WiFi connected successfully"),
-        Err(e) => log::error!("Failed to connect to WiFi: {}", e),
-    }
+    // Connect to Wi-Fi and store the wifi object to maintain ownership throughout the program's lifetime
+    let _wifi = match initialize_wifi(peripherals.modem) {
+        Ok(wifi) => {
+            log::info!("WiFi connected successfully");
+            wifi
+        },
+        Err(e) => {
+            log::error!("Failed to connect to WiFi: {}", e);
+            return Err(e);
+        }
+    };
 
     // Test the LLM helper
     match test_llm_helper() {
@@ -627,10 +657,10 @@ fn main() -> anyhow::Result<()> {
         log::error!("Failed to mount SD card: {}", e);
         return Err(anyhow::anyhow!("Failed to mount SD card: {}", e));
     }
-    
+
     // No need for ResourceGuard - SdCard has Drop trait implemented
     // that will automatically unmount when sd goes out of scope
-    
+
     // Initialize speech recognition models
     let part_name = CString::new("model").unwrap();
     let models = unsafe { esp_srmodel_init(part_name.as_ptr()) };
@@ -648,7 +678,7 @@ fn main() -> anyhow::Result<()> {
             esp_sr::afe_mode_t_AFE_MODE_LOW_COST,
         )
     };
-    
+
     if afe_config.is_null() {
         log::error!("Failed to initialize AFE configuration");
         return Err(anyhow::anyhow!("Failed to initialize AFE configuration"));
@@ -664,7 +694,7 @@ fn main() -> anyhow::Result<()> {
         unsafe { afe_config_free(afe_config) };
         return Err(anyhow::anyhow!("Failed to create AFE handle"));
     }
-    
+
     let afe_data = match call_c_method!(afe_handle, create_from_config, afe_config) {
         Ok(data) => data,
         Err(e) => {
@@ -673,7 +703,7 @@ fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    
+
     // Free config after use
     unsafe { afe_config_free(afe_config) };
 
@@ -687,7 +717,7 @@ fn main() -> anyhow::Result<()> {
             chinese_str.as_ptr() as *const i8,
         )
     };
-    
+
     if mn_name.is_null() {
         log::error!("Failed to filter speech recognition model");
         return Err(anyhow::anyhow!("Failed to filter speech recognition model"));
@@ -698,7 +728,7 @@ fn main() -> anyhow::Result<()> {
         log::error!("Failed to get multinet handle");
         return Err(anyhow::anyhow!("Failed to get multinet handle"));
     }
-    
+
     let model_data = match call_c_method!(multinet, create, mn_name, 6000) {
         Ok(data) => data,
         Err(e) => {
@@ -726,11 +756,11 @@ fn main() -> anyhow::Result<()> {
     // Create the feed task
     let _feed_task = unsafe {
         hal::task::create(
-            feed_proc, 
-            &*CString::new("feed_task").unwrap(), 
-            8 * 1024, 
-            Box::into_raw(feed_task_arg) as *mut c_void, 
-            5, 
+            feed_proc,
+            &*CString::new("feed_task").unwrap(),
+            8 * 1024,
+            Box::into_raw(feed_task_arg) as *mut c_void,
+            5,
             None
         )
     }?;
@@ -747,11 +777,11 @@ fn main() -> anyhow::Result<()> {
     // Create the fetch task
     let _fetch_task = unsafe {
         hal::task::create(
-            fetch_proc, 
-            &*CString::new("fetch_task").unwrap(), 
-            8 * 1024, 
-            Box::into_raw(fetch_task_arg) as *mut c_void, 
-            5, 
+            fetch_proc,
+            &*CString::new("fetch_task").unwrap(),
+            8 * 1024,
+            Box::into_raw(fetch_task_arg) as *mut c_void,
+            5,
             None
         )
     }?;
@@ -766,7 +796,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    
+
     // This code is unreachable, intentional for embedded applications
     // #[allow(unreachable_code)]
     // {

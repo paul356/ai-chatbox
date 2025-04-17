@@ -119,13 +119,13 @@ impl LlmHelper {
             temperature: 1.0,
             top_p: 1.0,
         };
-        
+
         // Initialize with system message
         helper.send_message("You are a helpful assistant".to_string(), ChatRole::System);
-        
+
         helper
     }
-    
+
     /// Get a copy of the message history
     pub fn get_history(&self) -> Vec<String> {
         self.message_history
@@ -133,7 +133,7 @@ impl LlmHelper {
             .map(|msg| format!("[{}]: {}", msg.role, msg.content))
             .collect()
     }
-    
+
     /// Clear the message history, keeping only the system message
     #[allow(dead_code)]
     pub fn clear_history(&mut self) {
@@ -145,26 +145,26 @@ impl LlmHelper {
                 .filter(|msg| msg.role == "system")
                 .cloned()
                 .collect();
-                
+
             self.message_history = system_messages;
         }
     }
-    
+
     /// Configure parameters for the LLM requests
     pub fn configure(&mut self, max_tokens: Option<u32>, temperature: Option<f32>, top_p: Option<f32>) {
         if let Some(tokens) = max_tokens {
             self.max_tokens = tokens;
         }
-        
+
         if let Some(temp) = temperature {
             self.temperature = temp;
         }
-        
+
         if let Some(p) = top_p {
             self.top_p = p;
         }
     }
-    
+
     /// Send a message to the LLM and get a response
     pub fn send_message(&mut self, text: String, role: ChatRole) -> String {
         // Create and store the new message
@@ -172,14 +172,14 @@ impl LlmHelper {
             role: role.as_str().to_string(),
             content: text,
         };
-        
+
         self.message_history.push(message);
-        
+
         // Don't make API calls for system messages
         if matches!(role, ChatRole::System) {
             return String::new();
         }
-        
+
         // Build and send request
         match self.make_api_request() {
             Ok(response) => response,
@@ -190,7 +190,7 @@ impl LlmHelper {
             }
         }
     }
-    
+
     /// Make the actual API request to DeepSeek using ESP-IDF HTTP client
     fn make_api_request(&mut self) -> Result<String> {
         // Prepare request payload
@@ -213,22 +213,49 @@ impl LlmHelper {
             logprobs: false,
             top_logprobs: None,
         };
-        
+
         let json_payload = serde_json::to_string(&request)?;
-        
+
         info!("Sending request to DeepSeek API...");
-        
-        // Create HTTP client configuration
+
+        // Create HTTP client configuration with TLS support
         let config = HttpConfiguration {
             timeout: Some(std::time::Duration::from_secs(30)),
             use_global_ca_store: true,
             crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
             ..Default::default()
         };
-        
+
+        // Try to resolve DNS for the hostname
+        use std::net::ToSocketAddrs;
+        let hostname = "api.deepseek.com";
+        let api_url = self.api_endpoint.clone();
+
+        // Log DNS resolution attempt but don't do any connection tests
+        info!("Attempting to resolve DNS for {}", hostname);
+        match (hostname, 443).to_socket_addrs() {
+            Ok(mut addrs) => {
+                if let Some(addr) = addrs.next() {
+                    info!("DNS resolution successful: {} -> {}", hostname, addr);
+                } else {
+                    warn!("DNS resolution returned empty result");
+                }
+            },
+            Err(e) => {
+                warn!("DNS resolution failed: {}", e);
+                // We'll still try to connect via the hostname in the URL
+            }
+        }
+
         // Create HTTP client
-        let mut client = EspHttpConnection::new(&config)?;
-        
+        let mut client = match EspHttpConnection::new(&config) {
+            Ok(client) => client,
+            Err(e) => {
+                error!("Failed to create HTTP client: {}", e);
+                return Err(anyhow::anyhow!("HTTP client creation failed: {}", e));
+            }
+        };
+
         // Prepare headers for the request
         let headers = [
             ("Content-Type", "application/json"),
@@ -236,53 +263,78 @@ impl LlmHelper {
             ("Authorization", &format!("Bearer {}", self.api_token)),
             ("Content-Length", &json_payload.len().to_string()),
         ];
-        
-        // Send the request with the JSON payload
-        client.initiate_request(Method::Post, &self.api_endpoint, &headers)?;
-        client.write(json_payload.as_bytes())?;
-        
+
+        // Send the request with better error handling
+        info!("Initiating HTTP request to {}", &api_url);
+        if let Err(e) = client.initiate_request(Method::Post, &api_url, &headers) {
+            error!("Failed to initiate HTTP request: {}", e);
+            return Err(anyhow::anyhow!("Failed to initiate HTTP request: {}", e));
+        }
+
+        if let Err(e) = client.write(json_payload.as_bytes()) {
+            error!("Failed to write request body: {}", e);
+            return Err(anyhow::anyhow!("Failed to write request body: {}", e));
+        }
+
         // Get the response status
         let status = client.status();
-        
+        info!("HTTP response status: {}", status);
+
         if status != 200 {
             return Err(anyhow::anyhow!("HTTP request failed with status: {}", status));
         }
-        
+
         // Read response body
         let mut response_body = Vec::new();
         let mut buffer = [0u8; 1024];
-        
+
         loop {
-            let bytes_read = client.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
+            match client.read(&mut buffer) {
+                Ok(bytes_read) => {
+                    if bytes_read == 0 {
+                        break;
+                    }
+                    response_body.extend_from_slice(&buffer[..bytes_read]);
+                },
+                Err(e) => {
+                    error!("Error reading response: {}", e);
+                    return Err(anyhow::anyhow!("Error reading response: {}", e));
+                }
             }
-            response_body.extend_from_slice(&buffer[..bytes_read]);
         }
-        
+
         // Parse the response
         let response_str = String::from_utf8(response_body)?;
-        let api_response: DeepSeekResponse = serde_json::from_str(&response_str)?;
-        
-        // Extract and store the assistant's response
-        if !api_response.choices.is_empty() {
-            let assistant_message = api_response.choices[0].message.clone();
-            
-            // Add the assistant response to the history
-            self.message_history.push(assistant_message.clone());
-            
-            info!(
-                "Response received. Tokens used: {} (prompt) + {} (completion) = {} (total)",
-                api_response.usage.prompt_tokens,
-                api_response.usage.completion_tokens,
-                api_response.usage.total_tokens
-            );
-            
-            Ok(assistant_message.content)
-        } else {
-            let error_msg = "No response choices returned from API".to_string();
-            warn!("{}", error_msg);
-            Ok(error_msg)
+
+        // Check if the response is valid JSON
+        match serde_json::from_str::<DeepSeekResponse>(&response_str) {
+            Ok(api_response) => {
+                // Extract and store the assistant's response
+                if !api_response.choices.is_empty() {
+                    let assistant_message = api_response.choices[0].message.clone();
+
+                    // Add the assistant response to the history
+                    self.message_history.push(assistant_message.clone());
+
+                    info!(
+                        "Response received. Tokens used: {} (prompt) + {} (completion) = {} (total)",
+                        api_response.usage.prompt_tokens,
+                        api_response.usage.completion_tokens,
+                        api_response.usage.total_tokens
+                    );
+
+                    Ok(assistant_message.content)
+                } else {
+                    let error_msg = "No response choices returned from API".to_string();
+                    warn!("{}", error_msg);
+                    Ok(error_msg)
+                }
+            },
+            Err(e) => {
+                error!("Failed to parse API response: {}", e);
+                error!("Raw response: {}", response_str);
+                Err(anyhow::anyhow!("Failed to parse API response: {}", e))
+            }
         }
     }
 }
@@ -291,7 +343,7 @@ impl LlmHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // Mock test for LlmHelper initialization
     #[test]
     fn test_llm_helper_new() {
@@ -301,7 +353,7 @@ mod tests {
         assert_eq!(helper.temperature, 1.0);
         assert!(!helper.message_history.is_empty()); // Should have system message
     }
-    
+
     // Test configuration
     #[test]
     fn test_configure() {
@@ -311,19 +363,19 @@ mod tests {
         assert_eq!(helper.temperature, 0.7);
         assert_eq!(helper.top_p, 0.9);
     }
-    
+
     // Test clearing history
     #[test]
     fn test_clear_history() {
         let mut helper = LlmHelper::new("fake_token", "deepseek-chat");
-        
+
         // Add a user message
         helper.send_message("Hello".to_string(), ChatRole::User);
         assert!(helper.message_history.len() > 1);
-        
+
         // Clear history
         helper.clear_history();
-        
+
         // Should keep system message(s)
         let system_count = helper.message_history
             .iter()
