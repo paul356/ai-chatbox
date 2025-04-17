@@ -23,7 +23,7 @@ use hound::{
     WavSpec,
 };
 use heapless;
-use std::{ffi::CString, os::raw::c_void};
+use std::{ffi::CString, os::raw::c_void, time::Instant};
 use sys::esp_sr::{
     self, afe_config_free, afe_config_init, esp_afe_handle_from_config, esp_mn_commands_add,
     esp_mn_commands_clear, esp_mn_commands_update, esp_mn_handle_from_name, esp_srmodel_filter,
@@ -78,7 +78,9 @@ fn init_mic<'d>(
 macro_rules! call_c_method {
     ($c_ptr: expr, $method: ident) => {
         unsafe {
-            if let Some(inner_func) = (*$c_ptr).$method {
+            if $c_ptr.is_null() {
+                Err(anyhow::anyhow!("Null pointer provided to {}", stringify!($method)))
+            } else if let Some(inner_func) = (*$c_ptr).$method {
                 Some(inner_func())
             } else {
                Err(anyhow::anyhow!("Failed to call method {}", stringify!($method)))
@@ -87,7 +89,9 @@ macro_rules! call_c_method {
     };
     ($c_ptr: expr, $method: ident, $($args: expr),*) => {
         unsafe {
-            if let Some(inner_func) = (*$c_ptr).$method {
+            if $c_ptr.is_null() {
+                Err(anyhow::anyhow!("Null pointer provided to {}", stringify!($method)))
+            } else if let Some(inner_func) = (*$c_ptr).$method {
                 Ok(inner_func($($args),*))
             } else {
                 Err(anyhow::anyhow!("Failed to call method {}", stringify!($method)))
@@ -130,9 +134,33 @@ extern "C" fn feed_proc(arg: * mut std::ffi::c_void) {
 // Define the State enum
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum State {
+    /// Waiting for wake word activation
     WakeWordDetecting,
+    /// Waiting for command after wake word detected
     CmdDetecting,
+    /// Recording audio after command detection
     Recording,
+}
+
+impl State {
+    /// Returns a human-readable description of the state
+    fn description(&self) -> &'static str {
+        match self {
+            State::WakeWordDetecting => "Waiting for wake word",
+            State::CmdDetecting => "Detecting command",
+            State::Recording => "Recording audio",
+        }
+    }
+    
+    /// Logs a state transition with appropriate log level
+    fn log_transition(from: State, to: State, reason: &str) {
+        if from == to {
+            log::debug!("State remains at {:?} ({}): {}", to, to.description(), reason);
+        } else {
+            log::info!("State transition: {:?} -> {:?} ({} → {}): {}", 
+                      from, to, from.description(), to.description(), reason);
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -154,41 +182,40 @@ fn print_fetch_result(res: *const esp_sr::afe_fetch_result_t) {
     }
 }
 
-// Add this helper function to flush FatFs filesystem
+// Helper function to flush FatFs filesystem with improved error handling
 fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
     // Create a temporary file to force a flush of the file system
     let flush_path = format!("{}/flush.tmp", mount_point);
+    
+    // Wrap the file operations in a separate scope to ensure file is closed before deletion
     {
-        let file = std::fs::File::create(&flush_path)?;
-        file.sync_all()?; // This calls fsync() which flushes dirty data
-    }
-    // Remove the temporary file
-    std::fs::remove_file(&flush_path)?;
-
-    /*
-    // On ESP-IDF, we can also directly call the esp_vfs_fat_sdmmc_unmount function
-    #[allow(non_snake_case)]
-    extern "C" {
-        fn esp_vfs_fat_sdcard_unmount(mount_point: *const std::os::raw::c_char, card: *mut std::os::raw::c_void) -> i32;
-    }
-
-    // This is a more aggressive approach - unmount and remount
-    // Only use if the above sync_all approach doesn't work
-    unsafe {
-        let c_mount_point = CString::new(mount_point)?;
-        let result = esp_vfs_fat_sdcard_unmount(c_mount_point.as_ptr(), std::ptr::null_mut());
-        if result != 0 {
-            log::warn!("Failed to unmount SD card: {}", result);
+        match std::fs::File::create(&flush_path) {
+            Ok(file) => {
+                // Sync the file to ensure data is written to disk
+                if let Err(e) = file.sync_all() {
+                    log::warn!("Failed to sync filesystem at {}: {}", mount_point, e);
+                    return Err(anyhow::anyhow!("Failed to sync filesystem: {}", e));
+                }
+            },
+            Err(e) => {
+                log::error!("Failed to create temp file at {}: {}", flush_path, e);
+                return Err(anyhow::anyhow!("Failed to create temp file for filesystem flush: {}", e));
+            }
         }
-
-        // Remount the card
-        let mut sd = sd_card::SdCard::new(mount_point);
-        sd.mount_spi()?;
     }
-    */
+    
+    // Remove the temporary file
+    match std::fs::remove_file(&flush_path) {
+        Ok(_) => {
+            log::info!("Filesystem at {} flushed successfully", mount_point);
+        },
+        Err(e) => {
+            log::warn!("Failed to remove temp file at {}: {}", flush_path, e);
+            // Continue execution - this is not a critical error
+        }
+    }
 
-    log::info!("Filesystem at {} flushed successfully", mount_point);
-    Ok(())
+   Ok(())
 }
 
 // Modify the RECORDING state code to flush data after finalizing WAV file
@@ -197,6 +224,23 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     let afe_data = arg.afe_data;
     let multinet = arg.multinet;
     let model_data = arg.model_data;
+    
+    // Validate pointers before using them
+    if afe_handle.is_null() {
+        return Err(anyhow::anyhow!("AFE handle is null"));
+    }
+    
+    if afe_data.is_null() {
+        return Err(anyhow::anyhow!("AFE data is null"));
+    }
+    
+    if multinet.is_null() {
+        return Err(anyhow::anyhow!("Multinet handle is null"));
+    }
+    
+    if model_data.is_null() {
+        return Err(anyhow::anyhow!("Model data is null"));
+    }
 
     // Initialize state
     let mut state = State::WakeWordDetecting;
@@ -211,13 +255,21 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
 
     log::info!("Starting detection loop with initial state: {:?}", state);
 
+    // Infinite loop for the state machine - this function never returns normally
     loop {
         // Always fetch data from AFE
         let res = call_c_method!(afe_handle, fetch, afe_data)?;
 
-        if res.is_null() || unsafe { (*res).ret_value } == esp_sr::ESP_FAIL {
-            log::error!("Fetch error!");
-            break;
+        if res.is_null() {
+            log::error!("Fetch returned null result");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        
+        if unsafe { (*res).ret_value } == esp_sr::ESP_FAIL {
+            log::error!("Fetch failed with ESP_FAIL");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
         }
 
         // Handle the data based on current state
@@ -225,7 +277,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
             State::WakeWordDetecting => {
                 if unsafe { (*res).wakeup_state } == esp_sr::wakenet_state_t_WAKENET_DETECTED {
                     let next_state = State::CmdDetecting;
-                    log::info!("Wake word detected. State transition: {:?} -> {:?}", state, next_state);
+                    State::log_transition(state, next_state, "Wake word detected");
 
                     call_c_method!(afe_handle, disable_wakenet, afe_data)?;
                     call_c_method!(multinet, clean, model_data)?;
@@ -248,8 +300,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                     }
 
                     let next_state = State::Recording;
-                    log::info!("Command detected (ID: {}). State transition: {:?} -> {:?}",
-                        command_id_str, state, next_state);
+                    State::log_transition(state, next_state, &format!("Command detected (ID: {})", command_id_str));
 
                     // Initialize WAV recording
                     let spec = WavSpec {
@@ -272,7 +323,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
 
                 } else if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_TIMEOUT {
                     let next_state = State::WakeWordDetecting;
-                    log::info!("Command detection timeout. State transition: {:?} -> {:?}", state, next_state);
+                    State::log_transition(state, next_state, "Command detection timeout");
 
                     call_c_method!(afe_handle, enable_wakenet, afe_data)?;
                     state = next_state;
@@ -302,8 +353,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                     silence_frames += 1;
                     if silence_frames >= frames_per_second { // More than 1 second of silence
                         let next_state = State::WakeWordDetecting;
-                        log::info!("Detected {} frames of silence. State transition: {:?} -> {:?}",
-                            silence_frames, state, next_state);
+                        State::log_transition(state, next_state, &format!("Detected {} frames of silence", silence_frames));
 
                         // Finalize WAV file
                         if let Some(writer) = wav_writer.take() {
@@ -330,8 +380,6 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 extern "C" fn fetch_proc(arg: * mut std::ffi::c_void) {
@@ -410,7 +458,7 @@ fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
     }
 }
 
-// Update WiFi initialization function
+// Enhanced WiFi initialization function with better error handling and reconnection logic
 fn initialize_wifi() -> anyhow::Result<()> {
     // Get SSID and password from environment variables at compile time
     let ssid = env!("WIFI_SSID", "WiFi SSID must be set at compile time");
@@ -427,6 +475,7 @@ fn initialize_wifi() -> anyhow::Result<()> {
     let mut auth_method = AuthMethod::WPA2Personal;
     if pass.is_empty() {
         auth_method = AuthMethod::None;
+        log::info!("Using open WiFi network (no password)");
     }
 
     let mut client_config = ClientConfiguration {
@@ -445,40 +494,87 @@ fn initialize_wifi() -> anyhow::Result<()> {
     wifi.start()?;
     log::info!("WiFi started, connecting...");
 
-    wifi.connect()?;
-    log::info!("Waiting for connection...");
-
-    // Give it some time to connect
-    std::thread::sleep(std::time::Duration::from_secs(5));
-
-    if wifi.is_connected()? {
-        log::info!("WiFi connected successfully!");
-        let ip_info = wifi.sta_netif().get_ip_info()?;
-        log::info!("IP info: {:?}", ip_info);
-    } else {
-        log::warn!("WiFi not connected after timeout!");
+    // Try to connect with retries
+    let max_retries = 3;
+    let mut connected = false;
+    
+    for attempt in 1..=max_retries {
+        match wifi.connect() {
+            Ok(_) => {
+                log::info!("WiFi connect initiated (attempt {}/{}), waiting for connection...", attempt, max_retries);
+                
+                // Wait for connection with timeout
+                let max_wait_seconds = 10;
+                for _ in 0..max_wait_seconds {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    
+                    if let Ok(true) = wifi.is_connected() {
+                        connected = true;
+                        break;
+                    }
+                }
+                
+                if connected {
+                    break;
+                } else {
+                    log::warn!("WiFi connection timed out after {} seconds", max_wait_seconds);
+                }
+            },
+            Err(e) => {
+                log::error!("Failed to connect to WiFi (attempt {}/{}): {}", attempt, max_retries, e);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
     }
 
-    Ok(())
+    if connected {
+        log::info!("WiFi connected successfully!");
+        match wifi.sta_netif().get_ip_info() {
+            Ok(ip_info) => log::info!("IP info: {:?}", ip_info),
+            Err(e) => log::warn!("Failed to get IP info: {}", e),
+        }
+        Ok(())
+    } else {
+        let err_msg = format!("Failed to connect to WiFi '{}' after {} attempts", ssid, max_retries);
+        log::error!("{}", err_msg);
+        Err(anyhow::anyhow!(err_msg))
+    }
 }
 
-// Test function for LLM functionality
+// Test function for LLM functionality with improved error handling
 fn test_llm_helper() -> anyhow::Result<()> {
     // Get token from environment variable at compile time
     let token = env!("LLM_AUTH_TOKEN", "LLM authentication token must be set at compile time");
 
     log::info!("Creating LlmHelper instance to test DeepSeek API integration");
-    let mut llm = llm_intf::LlmHelper::new(token, "deepseek-chat");
+    
+    // Create LLM helper with error handling
+    let mut llm = match std::panic::catch_unwind(|| {
+        llm_intf::LlmHelper::new(token, "deepseek-chat")
+    }) {
+        Ok(helper) => helper,
+        Err(_) => return Err(anyhow::anyhow!("Failed to initialize LlmHelper"))
+    };
 
-    // Configure parameters
-    llm.configure(Some(256), Some(0.7), Some(0.9));
+    // Configure parameters with reasonable defaults for embedded use
+    llm.configure(
+        Some(256),  // Smaller token count to conserve memory
+        Some(0.7),  // Temperature - balanced between deterministic and creative
+        Some(0.9)   // Top-p - slightly more focused sampling
+    );
 
     // Send a test message
     log::info!("Sending test message to DeepSeek API");
+    
     let response = llm.send_message(
         "Hello! I'm testing the ESP32-S3 integration with DeepSeek AI. Can you confirm this is working?".to_string(),
         llm_intf::ChatRole::User
     );
+
+    if response.starts_with("Error:") {
+        log::error!("LLM API error: {}", response);
+        return Err(anyhow::anyhow!("LLM API request failed: {}", response));
+    }
 
     log::info!("Received response from DeepSeek API: {}", response);
 
@@ -502,8 +598,17 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("Starting AI Chatbox application");
 
+    // Create a performance timer to measure initialization time
+    let init_timer = Instant::now();
+
     // Take peripherals once at the beginning
-    let peripherals = Peripherals::take()?;
+    let peripherals = match Peripherals::take() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("Failed to take peripherals: {}", e);
+            return Err(anyhow::anyhow!("Failed to take peripherals: {}", e));
+        }
+    };
 
     // Connect to Wi-Fi
     match initialize_wifi() {
@@ -517,11 +622,23 @@ fn main() -> anyhow::Result<()> {
         Err(e) => log::error!("LLM test failed: {}", e),
     }
 
+    // Mount SD card with proper error handling
     let mut sd = sd_card::SdCard::new("/vfat");
-    sd.mount_spi()?;
-
+    if let Err(e) = sd.mount_spi() {
+        log::error!("Failed to mount SD card: {}", e);
+        return Err(anyhow::anyhow!("Failed to mount SD card: {}", e));
+    }
+    
+    // No need for ResourceGuard - SdCard has Drop trait implemented
+    // that will automatically unmount when sd goes out of scope
+    
+    // Initialize speech recognition models
     let part_name = CString::new("model").unwrap();
     let models = unsafe { esp_srmodel_init(part_name.as_ptr()) };
+    if models.is_null() {
+        log::error!("Failed to initialize speech recognition models");
+        return Err(anyhow::anyhow!("Failed to initialize speech recognition models"));
+    }
 
     let input_format = CString::new("M").unwrap();
     let afe_config = unsafe {
@@ -532,14 +649,36 @@ fn main() -> anyhow::Result<()> {
             esp_sr::afe_mode_t_AFE_MODE_LOW_COST,
         )
     };
+    
+    if afe_config.is_null() {
+        log::error!("Failed to initialize AFE configuration");
+        return Err(anyhow::anyhow!("Failed to initialize AFE configuration"));
+    }
 
     // Print the AFE configuration
     print_afe_config(afe_config);
 
+    // Initialize AFE
     let afe_handle = unsafe { esp_afe_handle_from_config(afe_config) };
-    let afe_data = call_c_method!(afe_handle, create_from_config, afe_config)?;
+    if afe_handle.is_null() {
+        log::error!("Failed to create AFE handle from config");
+        unsafe { afe_config_free(afe_config) };
+        return Err(anyhow::anyhow!("Failed to create AFE handle"));
+    }
+    
+    let afe_data = match call_c_method!(afe_handle, create_from_config, afe_config) {
+        Ok(data) => data,
+        Err(e) => {
+            log::error!("Failed to create AFE data: {}", e);
+            unsafe { afe_config_free(afe_config) };
+            return Err(e);
+        }
+    };
+    
+    // Free config after use
     unsafe { afe_config_free(afe_config) };
 
+    // Initialize multinet for command recognition
     let prefix_str = Vec::from(esp_sr::ESP_MN_PREFIX);
     let chinese_str = Vec::from(esp_sr::ESP_MN_CHINESE);
     let mn_name = unsafe {
@@ -549,16 +688,34 @@ fn main() -> anyhow::Result<()> {
             chinese_str.as_ptr() as *const i8,
         )
     };
+    
+    if mn_name.is_null() {
+        log::error!("Failed to filter speech recognition model");
+        return Err(anyhow::anyhow!("Failed to filter speech recognition model"));
+    }
 
     let multinet = unsafe { esp_mn_handle_from_name(mn_name) };
-    let model_data = call_c_method!(multinet, create, mn_name, 6000)?;
+    if multinet.is_null() {
+        log::error!("Failed to get multinet handle");
+        return Err(anyhow::anyhow!("Failed to get multinet handle"));
+    }
+    
+    let model_data = match call_c_method!(multinet, create, mn_name, 6000) {
+        Ok(data) => data,
+        Err(e) => {
+            log::error!("Failed to create model data: {}", e);
+            return Err(e);
+        }
+    };
 
+    // Setup speech commands
     unsafe {
         esp_mn_commands_clear();
         esp_mn_commands_add(1, Vec::from(b"wo you wen ti\0").as_ptr() as *const i8);
         esp_mn_commands_update();
     }
 
+    // Create the feed task argument
     let feed_task_arg = Box::new(FeedTaskArg {
         afe_handle,
         afe_data,
@@ -567,10 +724,20 @@ fn main() -> anyhow::Result<()> {
         gpio_din: peripherals.pins.gpio41,
     });
 
-    let _ = unsafe {
-        hal::task::create(feed_proc, &*CString::new("feed_task").unwrap(), 8 * 1024, Box::into_raw(feed_task_arg) as *mut c_void, 5, None)
+    // Create the feed task
+    let _feed_task = unsafe {
+        hal::task::create(
+            feed_proc, 
+            &*CString::new("feed_task").unwrap(), 
+            8 * 1024, 
+            Box::into_raw(feed_task_arg) as *mut c_void, 
+            5, 
+            None
+        )
     }?;
+    log::info!("Feed task created successfully");
 
+    // Create the fetch task argument
     let fetch_task_arg = Box::new(FetchTaskArg {
         afe_handle,
         afe_data,
@@ -578,21 +745,32 @@ fn main() -> anyhow::Result<()> {
         model_data,
     });
 
-    let _ = unsafe {
-        hal::task::create(fetch_proc, &*CString::new("fetch_task").unwrap(), 8 * 1024, Box::into_raw(fetch_task_arg) as *mut c_void, 5, None)
+    // Create the fetch task
+    let _fetch_task = unsafe {
+        hal::task::create(
+            fetch_proc, 
+            &*CString::new("fetch_task").unwrap(), 
+            8 * 1024, 
+            Box::into_raw(fetch_task_arg) as *mut c_void, 
+            5, 
+            None
+        )
     }?;
+    log::info!("Fetch task created successfully");
 
-    // Main loop will never exit, so we don't need cleanup code
+    // Log initialization time
+    log::info!("AI Chatbox initialization completed in {} ms", init_timer.elapsed().as_millis());
+
+    // Simple infinite loop for embedded application - this is standard practice
+    // for embedded applications where the main thread can just sleep
+    log::info!("Entering main loop");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-
-    // NOTE: The following cleanup code is unreachable in the current design
-    // If you need cleanup to run, consider using a signal handler or other approach
+    
+    // This code is unreachable, intentional for embedded applications
     // #[allow(unreachable_code)]
     // {
-    //     let _ = call_c_method!(multinet, destroy, model_data);
-    //     let _ = call_c_method!(afe_handle, destroy, afe_data);
-    //     let _ = flush_filesystem("/vfat");
+    //    log::info!("Cleanup completed, exiting application");
     // }
 }
