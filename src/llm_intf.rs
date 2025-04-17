@@ -276,6 +276,13 @@ impl LlmHelper {
             return Err(anyhow::anyhow!("Failed to write request body: {}", e));
         }
 
+        // Finalize the request
+        if let Err(e) = client.initiate_response() {
+            error!("Failed to finalize HTTP request: {}", e);
+            return Err(anyhow::anyhow!("Failed to finalize HTTP request: {}", e));
+        }
+        info!("HTTP request sent successfully.");    
+
         // Get the response status
         let status = client.status();
         info!("HTTP response status: {}", status);
