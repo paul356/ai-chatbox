@@ -31,12 +31,119 @@ use sys::esp_sr::{
     esp_mn_commands_clear, esp_mn_commands_update, esp_mn_handle_from_name, esp_srmodel_filter,
     esp_srmodel_init
 };
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread;
 
 mod sd_card;
 mod llm_intf;
 
 #[allow(unused_imports)]
 use llm_intf::{LlmHelper, ChatRole};
+
+// Helper function to send a multipart request with a file
+fn send_multipart_request(
+    client: &mut EspHttpConnection,
+    url: &str,
+    file_path: &str,
+    file_data: &[u8]
+) -> anyhow::Result<()> {
+    // Create multipart form data boundary
+    let boundary = "------------------------boundary";
+    
+    // Create request body
+    let request_body = create_multipart_body(boundary, file_path, file_data);
+    
+    // Set up headers
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    let content_length = request_body.len().to_string();
+    
+    let headers = [
+        ("Content-Type", content_type.as_str()),
+        ("Content-Length", content_length.as_str()),
+    ];
+    
+    // Send the request
+    if let Err(e) = client.initiate_request(Method::Post, url, &headers) {
+        return Err(anyhow::anyhow!("Failed to initiate HTTP request: {}", e));
+    }
+    
+    // Write the request body
+    if let Err(e) = client.write(&request_body) {
+        return Err(anyhow::anyhow!("Failed to write request body: {}", e));
+    }
+    
+    // Finalize the request
+    if let Err(e) = client.initiate_response() {
+        return Err(anyhow::anyhow!("Failed to get response: {}", e));
+    }
+    
+    Ok(())
+}
+
+// Helper function to create a multipart request body
+fn create_multipart_body(boundary: &str, file_path: &str, file_data: &[u8]) -> Vec<u8> {
+    let filename = file_path.split('/').last().unwrap_or("audio.wav");
+    let content_disposition = format!("Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n", filename);
+    let content_type = "Content-Type: audio/wav\r\n\r\n";
+    
+    let mut request_body = Vec::new();
+    
+    // Add boundary start
+    request_body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    
+    // Add content disposition
+    request_body.extend_from_slice(content_disposition.as_bytes());
+    
+    // Add content type
+    request_body.extend_from_slice(content_type.as_bytes());
+    
+    // Add file data
+    request_body.extend_from_slice(file_data);
+    request_body.extend_from_slice(b"\r\n");
+    
+    // Add boundary end
+    request_body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+    
+    request_body
+}
+
+// Helper function to read response body
+fn read_response_body(client: &mut EspHttpConnection) -> anyhow::Result<String> {
+    let mut response_body = Vec::new();
+    let mut buffer = [0u8; 1024];
+    
+    loop {
+        match client.read(&mut buffer) {
+            Ok(bytes_read) => {
+                if bytes_read == 0 {
+                    break;
+                }
+                response_body.extend_from_slice(&buffer[..bytes_read]);
+            },
+            Err(e) => {
+                return Err(anyhow::anyhow!("Error reading response: {}", e));
+            }
+        }
+    }
+    
+    Ok(String::from_utf8_lossy(&response_body).to_string())
+}
+
+// Helper function to read and process HTTP response
+fn read_response(client: &mut EspHttpConnection) -> anyhow::Result<String> {
+    // Get status code
+    let status = client.status();
+    log::info!("Response status: {}", status);
+    
+    if status != 200 {
+        // Handle error response
+        let error_text = read_response_body(client)?;
+        return Err(anyhow::anyhow!("API error ({}): {}", status, error_text));
+    }
+    
+    // Read successful response
+    read_response_body(client)
+}
 
 // Update FeedTaskArg to include only the necessary peripherals needed for the microphone
 struct FeedTaskArg {
@@ -53,6 +160,95 @@ struct FetchTaskArg {
     afe_data: *mut esp_sr::esp_afe_sr_data_t,
     multinet: *mut esp_sr::esp_mn_iface_t,
     model_data: *mut esp_sr::model_iface_data_t,
+    transcription_tx: Sender<TranscriptionMessage>,
+}
+
+// Define message types for the transcription thread
+enum TranscriptionMessage {
+    TranscribeFile { path: String },
+    Shutdown,
+}
+
+// Worker function for the transcription thread
+fn transcription_worker(rx: Receiver<TranscriptionMessage>) -> anyhow::Result<()> {
+    log::info!("Transcription worker thread started");
+    
+    loop {
+        match rx.recv() {
+            Ok(TranscriptionMessage::TranscribeFile { path }) => {
+                log::info!("Received request to transcribe file: {}", path);
+                
+                match transcribe_audio(&path) {
+                    Ok(result) => {
+                        // Log once here, but don't log again in inner_fetch_proc
+                        log::info!("Transcription completed: {}", result);
+                        
+                        // Here we could send the result back to the main thread
+                        // or process it further, like sending to an LLM
+                    },
+                    Err(e) => {
+                        log::error!("Failed to transcribe audio: {}", e);
+                    }
+                }
+            },
+            Ok(TranscriptionMessage::Shutdown) => {
+                log::info!("Transcription worker received shutdown signal");
+                break;
+            },
+            Err(e) => {
+                log::error!("Error receiving message in transcription worker: {}", e);
+                break;
+            }
+        }
+    }
+    
+    log::info!("Transcription worker thread terminated");
+    Ok(())
+}
+
+// Function to create and start the transcription worker thread
+fn start_transcription_worker() -> anyhow::Result<Sender<TranscriptionMessage>> {
+    let (tx, rx) = mpsc::channel();
+    
+    thread::Builder::new()
+        .name("transcription_worker".to_string())
+        .stack_size(8 * 1024) // Same stack size as other threads
+        .spawn(move || {
+            if let Err(e) = transcription_worker(rx) {
+                log::error!("Transcription worker failed: {}", e);
+            }
+        })?;
+    
+    log::info!("Transcription worker thread created successfully");
+    Ok(tx)
+}
+
+// Function to send WAV file to transcription API with improved structure
+// This now runs in the separate thread
+fn transcribe_audio(file_path: &str) -> anyhow::Result<String> {
+    log::info!("Transcribing audio file: {}", file_path);
+    
+    // Read the WAV file
+    let file_data = std::fs::read(file_path)?;
+    log::info!("Read {} bytes from WAV file", file_data.len());
+    
+    // Set up the API endpoint
+    let transcription_api_url = "http://192.168.71.5:8000/transcribe";
+    
+    // Create HTTP client
+    let http_config = HttpConfiguration {
+        timeout: Some(std::time::Duration::from_secs(30)),
+        ..Default::default()
+    };
+    let mut client = EspHttpConnection::new(&http_config)?;
+    
+    // Send the multipart request and get response
+    send_multipart_request(&mut client, transcription_api_url, file_path, &file_data)?;
+    
+    // Process the response
+    let response_text = read_response(&mut client)?;
+    
+    Ok(response_text)
 }
 
 fn init_mic<'d>(
@@ -220,139 +416,6 @@ fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
    Ok(())
 }
 
-// Function to send WAV file to transcription API with improved structure
-fn transcribe_audio(file_path: &str) -> anyhow::Result<String> {
-    log::info!("Transcribing audio file: {}", file_path);
-    
-    // Read the WAV file
-    let file_data = std::fs::read(file_path)?;
-    log::info!("Read {} bytes from WAV file", file_data.len());
-    
-    // Set up the API endpoint
-    let transcription_api_url = "http://192.168.71.5:8000/transcribe";
-    
-    // Create HTTP client
-    let http_config = HttpConfiguration {
-        timeout: Some(std::time::Duration::from_secs(30)),
-        ..Default::default()
-    };
-    let mut client = EspHttpConnection::new(&http_config)?;
-    
-    // Send the multipart request and get response
-    send_multipart_request(&mut client, transcription_api_url, file_path, &file_data)?;
-    
-    // Process the response
-    let response_text = read_response(&mut client)?;
-    
-    log::info!("Transcription result: {}", response_text);
-    Ok(response_text)
-}
-
-// Helper function to send a multipart request with a file
-fn send_multipart_request(
-    client: &mut EspHttpConnection,
-    url: &str,
-    file_path: &str,
-    file_data: &[u8]
-) -> anyhow::Result<()> {
-    // Create multipart form data boundary
-    let boundary = "------------------------boundary";
-    
-    // Create request body
-    let request_body = create_multipart_body(boundary, file_path, file_data);
-    
-    // Set up headers
-    let content_type = format!("multipart/form-data; boundary={}", boundary);
-    let content_length = request_body.len().to_string();
-    
-    let headers = [
-        ("Content-Type", content_type.as_str()),
-        ("Content-Length", content_length.as_str()),
-    ];
-    
-    // Send the request
-    if let Err(e) = client.initiate_request(Method::Post, url, &headers) {
-        return Err(anyhow::anyhow!("Failed to initiate HTTP request: {}", e));
-    }
-    
-    // Write the request body
-    if let Err(e) = client.write(&request_body) {
-        return Err(anyhow::anyhow!("Failed to write request body: {}", e));
-    }
-    
-    // Finalize the request
-    if let Err(e) = client.initiate_response() {
-        return Err(anyhow::anyhow!("Failed to get response: {}", e));
-    }
-    
-    Ok(())
-}
-
-// Helper function to create a multipart request body
-fn create_multipart_body(boundary: &str, file_path: &str, file_data: &[u8]) -> Vec<u8> {
-    let filename = file_path.split('/').last().unwrap_or("audio.wav");
-    let content_disposition = format!("Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n", filename);
-    let content_type = "Content-Type: audio/wav\r\n\r\n";
-    
-    let mut request_body = Vec::new();
-    
-    // Add boundary start
-    request_body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    
-    // Add content disposition
-    request_body.extend_from_slice(content_disposition.as_bytes());
-    
-    // Add content type
-    request_body.extend_from_slice(content_type.as_bytes());
-    
-    // Add file data
-    request_body.extend_from_slice(file_data);
-    request_body.extend_from_slice(b"\r\n");
-    
-    // Add boundary end
-    request_body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
-    
-    request_body
-}
-
-// Helper function to read and process HTTP response
-fn read_response(client: &mut EspHttpConnection) -> anyhow::Result<String> {
-    // Get status code
-    let status = client.status();
-    log::info!("Response status: {}", status);
-    
-    if status != 200 {
-        // Handle error response
-        let error_text = read_response_body(client)?;
-        return Err(anyhow::anyhow!("API error ({}): {}", status, error_text));
-    }
-    
-    // Read successful response
-    read_response_body(client)
-}
-
-// Helper function to read response body
-fn read_response_body(client: &mut EspHttpConnection) -> anyhow::Result<String> {
-    let mut response_body = Vec::new();
-    let mut buffer = [0u8; 1024];
-    
-    loop {
-        match client.read(&mut buffer) {
-            Ok(bytes_read) => {
-                if bytes_read == 0 {
-                    break;
-                }
-                response_body.extend_from_slice(&buffer[..bytes_read]);
-            },
-            Err(e) => {
-                return Err(anyhow::anyhow!("Error reading response: {}", e));
-            }
-        }
-    }
-    
-    Ok(String::from_utf8_lossy(&response_body).to_string())
-}
-
 // Modify the RECORDING state code to flush data after finalizing WAV file
 fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     let afe_handle = arg.afe_handle;
@@ -466,9 +529,6 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
             },
 
             State::Recording => {
-                // Print details about the fetch result for debugging
-                //print_fetch_result(res);
-
                 // Check VAD state
                 let vad_state = unsafe { (*res).vad_state };
 
@@ -486,7 +546,9 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
 
                 if vad_state == sys::esp_sr::vad_state_t_VAD_SILENCE {
                     silence_frames += 1;
-                    if silence_frames >= frames_per_second { // More than 1 second of silence
+                    
+                    // Maybe increase this value to avoid cutting off speech too early
+                    if silence_frames >= frames_per_second * 2 { // 2 seconds of silence 
                         let next_state = State::WakeWordDetecting;
                         State::log_transition(state, next_state, &format!("Detected {} frames of silence", silence_frames));
 
@@ -498,18 +560,16 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                             // Flush the filesystem to ensure all data is written
                             if let Err(e) = flush_filesystem("/vfat") {
                                 log::warn!("Failed to flush filesystem: {}", e);
-                            }
-
-                            // Transcribe the audio file
-                            let file_path = format!("/vfat/audio{}.wav", file_idx - 1);
-                            match transcribe_audio(&file_path) {
-                                Ok(transcription) => {
-                                    log::info!("Transcription result: {}", transcription);
-
-                                    // Here you can process the transcription further
-                                    // For example, send it to the LLM for a response
-                                },
-                                Err(e) => log::error!("Failed to transcribe audio: {}", e),
+                            } else {
+                                log::info!("Filesystem flushed successfully");
+                                
+                                // Send a message to the transcription thread to process the file
+                                let file_path = format!("/vfat/audio{}.wav", file_idx - 1);
+                                if let Err(e) = arg.transcription_tx.send(TranscriptionMessage::TranscribeFile { path: file_path }) {
+                                    log::error!("Failed to send transcription message: {}", e);
+                                } else {
+                                    log::info!("Sent audio file for asynchronous transcription");
+                                }
                             }
                         }
 
@@ -653,7 +713,7 @@ fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<Box<EspWifi<'stat
                 let max_wait_seconds = 15; // Increased timeout for DHCP
                 let mut has_valid_ip = false;
 
-                for i in 1..=max_wait_seconds {
+                for _i in 1..=max_wait_seconds {
                     std::thread::sleep(std::time::Duration::from_secs(1));
 
                     // First check if connected
@@ -793,10 +853,10 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Test the LLM helper
-    match test_llm_helper() {
+    /*match test_llm_helper() {
         Ok(_) => log::info!("LLM test completed successfully"),
         Err(e) => log::error!("LLM test failed: {}", e),
-    }
+    }*/
 
     // Mount SD card with proper error handling
     let mut sd = sd_card::SdCard::new("/vfat");
@@ -891,6 +951,16 @@ fn main() -> anyhow::Result<()> {
         esp_mn_commands_update();
     }
 
+    // Start the transcription worker thread
+    let transcription_tx = match start_transcription_worker() {
+        Ok(tx) => tx,
+        Err(e) => {
+            log::error!("Failed to start transcription worker: {}", e);
+            return Err(anyhow::anyhow!("Failed to start transcription worker: {}", e));
+        }
+    };
+    log::info!("Transcription worker started successfully");
+
     // Create the feed task argument
     let feed_task_arg = Box::new(FeedTaskArg {
         afe_handle,
@@ -913,12 +983,13 @@ fn main() -> anyhow::Result<()> {
     }?;
     log::info!("Feed task created successfully");
 
-    // Create the fetch task argument
+    // Create the fetch task argument with transcription channel
     let fetch_task_arg = Box::new(FetchTaskArg {
         afe_handle,
         afe_data,
         multinet,
         model_data,
+        transcription_tx,
     });
 
     // Create the fetch task
@@ -943,10 +1014,4 @@ fn main() -> anyhow::Result<()> {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-
-    // This code is unreachable, intentional for embedded applications
-    // #[allow(unreachable_code)]
-    // {
-    //    log::info!("Cleanup completed, exiting application");
-    // }
 }
