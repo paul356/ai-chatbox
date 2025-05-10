@@ -223,6 +223,8 @@ impl LlmHelper {
             ..Default::default()
         };
 
+        let api_url = self.api_endpoint.clone();
+
         // Create HTTP client
         let mut client = match EspHttpConnection::new(&config) {
             Ok(client) => client,
