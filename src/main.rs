@@ -173,18 +173,53 @@ enum TranscriptionMessage {
 fn transcription_worker(rx: Receiver<TranscriptionMessage>) -> anyhow::Result<()> {
     log::info!("Transcription worker thread started");
     
+    // Get token from environment variable at compile time
+    let token = env!("LLM_AUTH_TOKEN", "LLM authentication token must be set at compile time");
+    
+    // Create and configure the LLM helper
+    let mut llm = match llm_intf::LlmHelper::new(token, "deepseek-chat") {
+        helper => {
+            log::info!("LLM helper created successfully");
+            helper
+        }
+    };
+    
+    // Configure with parameters suitable for embedded device
+    llm.configure(
+        Some(512),  // Max tokens to generate in response
+        Some(0.7),  // Temperature - balanced between deterministic and creative
+        Some(0.9)   // Top-p - slightly more focused sampling
+    );
+    
+    // Send initial system message to set context
+    llm.send_message(
+        "接下来的请求来自一个语音转文字服务，请小心中间可能有一些字词被识别成同音的字词。".to_string(),
+        ChatRole::System
+    );
+    
+    log::info!("LLM helper initialized with system prompt");
+    
     loop {
         match rx.recv() {
             Ok(TranscriptionMessage::TranscribeFile { path }) => {
                 log::info!("Received request to transcribe file: {}", path);
                 
                 match transcribe_audio(&path) {
-                    Ok(result) => {
-                        // Log once here, but don't log again in inner_fetch_proc
-                        log::info!("Transcription completed: {}", result);
+                    Ok(transcription) => {
+                        log::info!("Transcription completed: {}", transcription);
                         
-                        // Here we could send the result back to the main thread
-                        // or process it further, like sending to an LLM
+                        // Send the transcription to the LLM
+                        log::info!("Sending transcription to LLM...");
+                        let response = llm.send_message(transcription, ChatRole::User);
+                        
+                        if response.starts_with("Error:") {
+                            log::error!("LLM API error: {}", response);
+                        } else {
+                            log::info!("LLM response: {}", response);
+                            
+                            // Here you would send the response to a text-to-speech system
+                            // For now, we just log it
+                        }
                     },
                     Err(e) => {
                         log::error!("Failed to transcribe audio: {}", e);

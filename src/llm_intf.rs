@@ -120,9 +120,6 @@ impl LlmHelper {
             top_p: 1.0,
         };
 
-        // Initialize with system message
-        helper.send_message("You are a helpful assistant".to_string(), ChatRole::System);
-
         helper
     }
 
@@ -226,27 +223,6 @@ impl LlmHelper {
             ..Default::default()
         };
 
-        // Try to resolve DNS for the hostname
-        use std::net::ToSocketAddrs;
-        let hostname = "api.deepseek.com";
-        let api_url = self.api_endpoint.clone();
-
-        // Log DNS resolution attempt but don't do any connection tests
-        info!("Attempting to resolve DNS for {}", hostname);
-        match (hostname, 443).to_socket_addrs() {
-            Ok(mut addrs) => {
-                if let Some(addr) = addrs.next() {
-                    info!("DNS resolution successful: {} -> {}", hostname, addr);
-                } else {
-                    warn!("DNS resolution returned empty result");
-                }
-            },
-            Err(e) => {
-                warn!("DNS resolution failed: {}", e);
-                // We'll still try to connect via the hostname in the URL
-            }
-        }
-
         // Create HTTP client
         let mut client = match EspHttpConnection::new(&config) {
             Ok(client) => client,
@@ -281,7 +257,7 @@ impl LlmHelper {
             error!("Failed to finalize HTTP request: {}", e);
             return Err(anyhow::anyhow!("Failed to finalize HTTP request: {}", e));
         }
-        info!("HTTP request sent successfully.");    
+        info!("HTTP request sent successfully.");
 
         // Get the response status
         let status = client.status();
