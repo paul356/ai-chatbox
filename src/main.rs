@@ -268,7 +268,7 @@ fn transcribe_audio(file_path: &str) -> anyhow::Result<String> {
     log::info!("Read {} bytes from WAV file", file_data.len());
     
     // Set up the API endpoint
-    let transcription_api_url = "http://192.168.71.5:8000/transcribe";
+    let transcription_api_url = "http://192.168.1.4:5000/transcribe";
     
     // Create HTTP client
     let http_config = HttpConfiguration {
@@ -904,7 +904,7 @@ fn main() -> anyhow::Result<()> {
     // that will automatically unmount when sd goes out of scope
 
     // Initialize speech recognition models
-    let part_name = CString::new("model").unwrap();
+    let part_name = CString::new("/vfat").unwrap();
     let models = unsafe { esp_srmodel_init(part_name.as_ptr()) };
     if models.is_null() {
         log::error!("Failed to initialize speech recognition models");
@@ -982,7 +982,7 @@ fn main() -> anyhow::Result<()> {
     // Setup speech commands
     unsafe {
         esp_mn_commands_clear();
-        esp_mn_commands_add(1, Vec::from(b"wo you wen ti\0").as_ptr() as *const i8);
+        esp_mn_commands_add(1, Vec::from(b"wo you ge wen ti\0").as_ptr() as *const i8);
         esp_mn_commands_update();
     }
 
