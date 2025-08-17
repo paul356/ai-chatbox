@@ -20,9 +20,9 @@ FILE_SIZE=$(stat -c%s "voice_data.dat")
 echo "Voice data file size: $FILE_SIZE bytes"
 
 # Flash the voice data to the partition
-python -m esptool --chip esp32s3 --port $DEVICE --baud 115200 write_flash 0x290000 voice_data.dat
+python -m esptool --chip esp32s3 --port $DEVICE --baud 115200 write_flash 0x410000 voice_data.dat
 
 echo "Voice data upload completed!"
 echo ""
 echo "Note: Make sure the partition table includes:"
-echo "voice_data, data, spiffs, 0x290000, 2048K"
+echo "voice_data, data, spiffs, 0x410000, $(( (${FILE_SIZE} + 1023) / 1024 ))K"
