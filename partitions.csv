@@ -2,5 +2,6 @@
 # Name,  Type, SubType, Offset,  Size
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
-factory, app,  factory, 0x010000, 2560K
-#model,  data, spiffs,  0x290000, 5168K
+factory, app,  factory, 0x010000, 4M
+voice_data, data,  fat, 0x410000, 3890K
+#model,  data, spiffs,  0x490000, 3120K

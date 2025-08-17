@@ -1,109 +1,111 @@
 use anyhow;
 use esp_idf_svc::hal::{
     self,
-    gpio::{Gpio41, Gpio42, InputPin, OutputPin},
+    gpio::{Gpio41, Gpio42, InputPin, OutputPin, PinDriver},
     i2s::{
         config::{
             ClockSource, Config, DataBitWidth, MclkMultiple, PdmDownsample, PdmRxClkConfig,
-            PdmRxConfig, PdmRxGpioConfig, PdmRxSlotConfig, SlotMode,
+            PdmRxConfig, PdmRxGpioConfig, PdmRxSlotConfig, SlotMode, StdConfig, StdClkConfig, StdGpioConfig, StdSlotConfig
         },
-        I2s, I2sDriver, I2sRx, I2S0,
+        I2s, I2sDriver, I2sRx, I2sTx, I2S0, I2S1,
     },
     peripheral::Peripheral,
     peripherals::Peripherals,
 };
 use esp_idf_svc::{
-    sys,
-    wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi},
-    nvs::EspDefaultNvsPartition,
     eventloop::EspSystemEventLoop,
     http::client::{Configuration as HttpConfiguration, EspHttpConnection}, // Add HTTP client
-    http::Method, // Add Method enum
-};
-use hound::{
-    WavWriter,
-    WavSpec,
+    http::Method,                                                          // Add Method enum
+    nvs::EspDefaultNvsPartition,
+    sys,
+    wifi::{AuthMethod, ClientConfiguration, Configuration, EspWifi},
 };
 use heapless;
+use hound::{WavSpec, WavWriter};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::{ffi::CString, os::raw::c_void, time::Instant};
 use sys::esp_sr::{
     self, afe_config_free, afe_config_init, esp_afe_handle_from_config, esp_mn_commands_add,
     esp_mn_commands_clear, esp_mn_commands_update, esp_mn_handle_from_name, esp_srmodel_filter,
-    esp_srmodel_init
+    esp_srmodel_init,
 };
-use std::sync::mpsc::{self, Sender, Receiver};
-use std::thread;
 
-mod sd_card;
 mod llm_intf;
+mod sd_card;
+mod tts;
 
 #[allow(unused_imports)]
-use llm_intf::{LlmHelper, ChatRole};
+use llm_intf::{ChatRole, LlmHelper};
+use tts::{TtsEngine, TtsConfig};
 
 // Helper function to send a multipart request with a file
 fn send_multipart_request(
     client: &mut EspHttpConnection,
     url: &str,
     file_path: &str,
-    file_data: &[u8]
+    file_data: &[u8],
 ) -> anyhow::Result<()> {
     // Create multipart form data boundary
     let boundary = "------------------------boundary";
-    
+
     // Create request body
     let request_body = create_multipart_body(boundary, file_path, file_data);
-    
+
     // Set up headers
     let content_type = format!("multipart/form-data; boundary={}", boundary);
     let content_length = request_body.len().to_string();
-    
+
     let headers = [
         ("Content-Type", content_type.as_str()),
         ("Content-Length", content_length.as_str()),
     ];
-    
+
     // Send the request
     if let Err(e) = client.initiate_request(Method::Post, url, &headers) {
         return Err(anyhow::anyhow!("Failed to initiate HTTP request: {}", e));
     }
-    
+
     // Write the request body
     if let Err(e) = client.write(&request_body) {
         return Err(anyhow::anyhow!("Failed to write request body: {}", e));
     }
-    
+
     // Finalize the request
     if let Err(e) = client.initiate_response() {
         return Err(anyhow::anyhow!("Failed to get response: {}", e));
     }
-    
+
     Ok(())
 }
 
 // Helper function to create a multipart request body
 fn create_multipart_body(boundary: &str, file_path: &str, file_data: &[u8]) -> Vec<u8> {
     let filename = file_path.split('/').last().unwrap_or("audio.wav");
-    let content_disposition = format!("Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n", filename);
+    let content_disposition = format!(
+        "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
+        filename
+    );
     let content_type = "Content-Type: audio/wav\r\n\r\n";
-    
+
     let mut request_body = Vec::new();
-    
+
     // Add boundary start
     request_body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    
+
     // Add content disposition
     request_body.extend_from_slice(content_disposition.as_bytes());
-    
+
     // Add content type
     request_body.extend_from_slice(content_type.as_bytes());
-    
+
     // Add file data
     request_body.extend_from_slice(file_data);
     request_body.extend_from_slice(b"\r\n");
-    
+
     // Add boundary end
     request_body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
-    
+
     request_body
 }
 
@@ -111,7 +113,7 @@ fn create_multipart_body(boundary: &str, file_path: &str, file_data: &[u8]) -> V
 fn read_response_body(client: &mut EspHttpConnection) -> anyhow::Result<String> {
     let mut response_body = Vec::new();
     let mut buffer = [0u8; 1024];
-    
+
     loop {
         match client.read(&mut buffer) {
             Ok(bytes_read) => {
@@ -119,13 +121,13 @@ fn read_response_body(client: &mut EspHttpConnection) -> anyhow::Result<String> 
                     break;
                 }
                 response_body.extend_from_slice(&buffer[..bytes_read]);
-            },
+            }
             Err(e) => {
                 return Err(anyhow::anyhow!("Error reading response: {}", e));
             }
         }
     }
-    
+
     Ok(String::from_utf8_lossy(&response_body).to_string())
 }
 
@@ -134,13 +136,13 @@ fn read_response(client: &mut EspHttpConnection) -> anyhow::Result<String> {
     // Get status code
     let status = client.status();
     log::info!("Response status: {}", status);
-    
+
     if status != 200 {
         // Handle error response
         let error_text = read_response_body(client)?;
         return Err(anyhow::anyhow!("API error ({}): {}", status, error_text));
     }
-    
+
     // Read successful response
     read_response_body(client)
 }
@@ -170,12 +172,15 @@ enum TranscriptionMessage {
 }
 
 // Worker function for the transcription thread
-fn transcription_worker(rx: Receiver<TranscriptionMessage>) -> anyhow::Result<()> {
+fn transcription_worker(
+    rx: Receiver<TranscriptionMessage>,
+    mut i2s_driver: I2sDriver<'static, I2sTx>,
+) -> anyhow::Result<()> {
     log::info!("Transcription worker thread started");
-    
+
     // Get token from environment variable at compile time
-    let token = env!("LLM_AUTH_TOKEN", "LLM authentication token must be set at compile time");
-    
+    let token = env!("LLM_AUTH_TOKEN");
+
     // Create and configure the LLM helper
     let mut llm = match llm_intf::LlmHelper::new(token, "deepseek-chat") {
         helper => {
@@ -183,77 +188,107 @@ fn transcription_worker(rx: Receiver<TranscriptionMessage>) -> anyhow::Result<()
             helper
         }
     };
-    
+
     // Configure with parameters suitable for embedded device
     llm.configure(
-        Some(512),  // Max tokens to generate in response
-        Some(0.7),  // Temperature - balanced between deterministic and creative
-        Some(0.9)   // Top-p - slightly more focused sampling
+        Some(512), // Max tokens to generate in response
+        Some(0.7), // Temperature - balanced between deterministic and creative
+        Some(0.9), // Top-p - slightly more focused sampling
     );
-    
+
     // Send initial system message to set context
     llm.send_message(
-        "接下来的请求来自一个语音转文字服务，请小心中间可能有一些字词被识别成同音的字词。".to_string(),
-        ChatRole::System
+        "接下来的请求来自一个语音转文字服务，请小心中间可能有一些字词被识别成同音的字词。回答请简短，只需要一段文字，不要超过80个字。"
+            .to_string(),
+        ChatRole::System,
     );
-    
+
     log::info!("LLM helper initialized with system prompt");
-    
+
+    // Initialize TTS engine
+    let mut tts_engine = match TtsEngine::new_with_config(TtsConfig {
+        max_chunk_chars: 30, // Smaller chunks for embedded device
+        chunk_delay_ms: 100, // Longer delay to allow watchdog reset
+        speed: 3,
+    }) {
+        Ok(engine) => {
+            log::info!("TTS engine initialized successfully with chunking configuration");
+            engine
+        }
+        Err(e) => {
+            log::error!("Failed to initialize TTS engine: {}", e);
+            return Err(e);
+        }
+    };
+
+    tts_engine.synthesize_and_play("你好，乐鑫", &mut i2s_driver);
+
     loop {
         match rx.recv() {
             Ok(TranscriptionMessage::TranscribeFile { path }) => {
                 log::info!("Received request to transcribe file: {}", path);
-                
+
                 match transcribe_audio(&path) {
                     Ok(transcription) => {
                         log::info!("Transcription completed: {}", transcription);
-                        
+
                         // Send the transcription to the LLM
                         log::info!("Sending transcription to LLM...");
+
                         let response = llm.send_message(transcription, ChatRole::User);
-                        
+
                         if response.starts_with("Error:") {
                             log::error!("LLM API error: {}", response);
                         } else {
                             log::info!("LLM response: {}", response);
-                            
-                            // Here you would send the response to a text-to-speech system
-                            // For now, we just log it
+
+                            // Convert LLM response to audio using TTS
+                            log::info!("Converting LLM response to audio...");
+
+                            if let Err(e) =
+                                tts_engine.synthesize_and_play(&response, &mut i2s_driver)
+                            {
+                                log::error!("Failed to synthesize and play audio: {}", e);
+                            } else {
+                                log::info!("Audio synthesis and playback completed successfully");
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
                         log::error!("Failed to transcribe audio: {}", e);
                     }
                 }
-            },
+            }
             Ok(TranscriptionMessage::Shutdown) => {
                 log::info!("Transcription worker received shutdown signal");
                 break;
-            },
+            }
             Err(e) => {
                 log::error!("Error receiving message in transcription worker: {}", e);
                 break;
             }
         }
     }
-    
+
     log::info!("Transcription worker thread terminated");
     Ok(())
 }
 
 // Function to create and start the transcription worker thread
-fn start_transcription_worker() -> anyhow::Result<Sender<TranscriptionMessage>> {
+fn start_transcription_worker(
+    i2s_driver: I2sDriver<'static, I2sTx>,
+) -> anyhow::Result<Sender<TranscriptionMessage>> {
     let (tx, rx) = mpsc::channel();
-    
+
     thread::Builder::new()
         .name("transcription_worker".to_string())
-        .stack_size(8 * 1024) // Same stack size as other threads
+        .stack_size(16 * 1024) // Increase stack size for TTS operations
         .spawn(move || {
-            if let Err(e) = transcription_worker(rx) {
+            if let Err(e) = transcription_worker(rx, i2s_driver) {
                 log::error!("Transcription worker failed: {}", e);
             }
         })?;
-    
+
     log::info!("Transcription worker thread created successfully");
     Ok(tx)
 }
@@ -262,27 +297,27 @@ fn start_transcription_worker() -> anyhow::Result<Sender<TranscriptionMessage>> 
 // This now runs in the separate thread
 fn transcribe_audio(file_path: &str) -> anyhow::Result<String> {
     log::info!("Transcribing audio file: {}", file_path);
-    
+
     // Read the WAV file
     let file_data = std::fs::read(file_path)?;
     log::info!("Read {} bytes from WAV file", file_data.len());
-    
+
     // Set up the API endpoint
-    let transcription_api_url = "http://192.168.1.4:5000/transcribe";
-    
+    let transcription_api_url = env!("VOS_URL");//"http://192.168.71.5:8000/transcribe";
+
     // Create HTTP client
     let http_config = HttpConfiguration {
         timeout: Some(std::time::Duration::from_secs(30)),
         ..Default::default()
     };
     let mut client = EspHttpConnection::new(&http_config)?;
-    
+
     // Send the multipart request and get response
     send_multipart_request(&mut client, transcription_api_url, file_path, &file_data)?;
-    
+
     // Process the response
     let response_text = read_response(&mut client)?;
-    
+
     Ok(response_text)
 }
 
@@ -306,6 +341,63 @@ fn init_mic<'d>(
     pdm_driver.rx_enable()?;
 
     Ok(pdm_driver)
+}
+
+fn init_i2s_tx(
+    i2s_slot: I2S1,
+    bclk_pin: impl Peripheral<P = impl InputPin + OutputPin> + 'static,
+    dout_pin: impl Peripheral<P = impl OutputPin> + 'static,
+    ws_pin: impl Peripheral<P = impl InputPin + OutputPin> + 'static,
+) -> anyhow::Result<I2sDriver<'static, I2sTx>> {
+    log::info!("Starting MAX98357 I2S audio test");
+
+    // Configure I2S for audio output
+    let sample_rate = 16000u32;
+    let i2s_config = StdConfig::new(
+        Config::default(),
+        StdClkConfig::from_sample_rate_hz(sample_rate),
+        StdSlotConfig::philips_slot_default(DataBitWidth::Bits16, SlotMode::Mono),
+        #[cfg(not(esp_idf_version_major = "4"))]
+        StdGpioConfig::default(),
+    );
+
+    let mut i2s_driver = I2sDriver::new_std_tx(
+        i2s_slot,
+        &i2s_config,
+        bclk_pin,                                      // BCLK
+        dout_pin,                                      // DOUT (connects to DIN on MAX98357)
+        Option::<esp_idf_svc::hal::gpio::Gpio0>::None, // MCLK (not needed for MAX98357)
+        ws_pin,                                        // WS (LRCLK)
+    )?;
+
+    log::info!("I2S driver initialized successfully");
+
+    // Enable the I2S channel
+    i2s_driver.tx_enable()?;
+    log::info!("I2S TX channel enabled");
+
+    Ok(i2s_driver)
+}
+
+fn configure_max98357_pins(
+    gain_pin: impl Peripheral<P = impl OutputPin> + 'static,
+    sd_pin: impl Peripheral<P = impl OutputPin> + 'static,
+) -> anyhow::Result<(
+    PinDriver<'static, impl OutputPin, esp_idf_svc::hal::gpio::Output>,
+    PinDriver<'static, impl OutputPin, esp_idf_svc::hal::gpio::Output>,
+)> {
+    // Configure MAX98357 control pins
+    // GAIN pin (GPIO4) - controls gain level
+    let mut gain_pin_driver = PinDriver::output(gain_pin)?;
+    gain_pin_driver.set_high()?; // Set gain to 15dB (high), or set_low() for 9dB
+
+    // SD pin (GPIO5) - shutdown control (active low)
+    let mut sd_pin_driver = PinDriver::output(sd_pin)?;
+    sd_pin_driver.set_high()?; // Enable the amplifier (not shutdown)
+
+    log::info!("MAX98357 control pins configured");
+
+    Ok((gain_pin_driver, sd_pin_driver))
 }
 
 macro_rules! call_c_method {
@@ -345,17 +437,26 @@ fn inner_feed_proc(feed_arg: &mut Box<FeedTaskArg>) -> anyhow::Result<()> {
     let chunk_size = call_c_method!(feed_arg.afe_handle, get_feed_chunksize, feed_arg.afe_data)?;
     let channel_num = call_c_method!(feed_arg.afe_handle, get_feed_channel_num, feed_arg.afe_data)?;
 
-    log::info!("[INFO] chunk_size {}, channel_num {}", chunk_size, channel_num);
+    log::info!(
+        "[INFO] chunk_size {}, channel_num {}",
+        chunk_size,
+        channel_num
+    );
 
     let mut chunk = vec![0u8; 2 * chunk_size as usize * channel_num as usize];
 
     loop {
         mic.read(chunk.as_mut_slice(), 100)?;
-        let _ = call_c_method!(feed_arg.afe_handle, feed, feed_arg.afe_data, chunk.as_ptr() as *const i16)?;
+        let _ = call_c_method!(
+            feed_arg.afe_handle,
+            feed,
+            feed_arg.afe_data,
+            chunk.as_ptr() as *const i16
+        )?;
     }
 }
 
-extern "C" fn feed_proc(arg: * mut std::ffi::c_void) {
+extern "C" fn feed_proc(arg: *mut std::ffi::c_void) {
     let mut feed_arg = unsafe { Box::from_raw(arg as *mut FeedTaskArg) };
 
     match inner_feed_proc(&mut feed_arg) {
@@ -388,10 +489,21 @@ impl State {
     /// Logs a state transition with appropriate log level
     fn log_transition(from: State, to: State, reason: &str) {
         if from == to {
-            log::debug!("State remains at {:?} ({}): {}", to, to.description(), reason);
+            log::debug!(
+                "State remains at {:?} ({}): {}",
+                to,
+                to.description(),
+                reason
+            );
         } else {
-            log::info!("State transition: {:?} -> {:?} ({} → {}): {}",
-                      from, to, from.description(), to.description(), reason);
+            log::info!(
+                "State transition: {:?} -> {:?} ({} → {}): {}",
+                from,
+                to,
+                from.description(),
+                to.description(),
+                reason
+            );
         }
     }
 }
@@ -429,10 +541,13 @@ fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
                     log::warn!("Failed to sync filesystem at {}: {}", mount_point, e);
                     return Err(anyhow::anyhow!("Failed to sync filesystem: {}", e));
                 }
-            },
+            }
             Err(e) => {
                 log::error!("Failed to create temp file at {}: {}", flush_path, e);
-                return Err(anyhow::anyhow!("Failed to create temp file for filesystem flush: {}", e));
+                return Err(anyhow::anyhow!(
+                    "Failed to create temp file for filesystem flush: {}",
+                    e
+                ));
             }
         }
     }
@@ -441,14 +556,14 @@ fn flush_filesystem(mount_point: &str) -> anyhow::Result<()> {
     match std::fs::remove_file(&flush_path) {
         Ok(_) => {
             log::info!("Filesystem at {} flushed successfully", mount_point);
-        },
+        }
         Err(e) => {
             log::warn!("Failed to remove temp file at {}: {}", flush_path, e);
             // Continue execution - this is not a critical error
         }
     }
 
-   Ok(())
+    Ok(())
 }
 
 // Modify the RECORDING state code to flush data after finalizing WAV file
@@ -516,7 +631,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                     call_c_method!(multinet, clean, model_data)?;
                     state = next_state;
                 }
-            },
+            }
 
             State::CmdDetecting => {
                 let mn_state = call_c_method!(multinet, detect, model_data, (*res).data)?;
@@ -533,7 +648,11 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                     }
 
                     let next_state = State::Recording;
-                    State::log_transition(state, next_state, &format!("Command detected (ID: {})", command_id_str));
+                    State::log_transition(
+                        state,
+                        next_state,
+                        &format!("Command detected (ID: {})", command_id_str),
+                    );
 
                     // Initialize WAV recording
                     let spec = WavSpec {
@@ -548,12 +667,14 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                     file_idx += 1;
 
                     log::info!("Creating WAV file: /vfat/audio{}.wav", current_file_idx);
-                    let writer = WavWriter::create(std::format!("/vfat/audio{}.wav", current_file_idx), spec)?;
+                    let writer = WavWriter::create(
+                        std::format!("/vfat/audio{}.wav", current_file_idx),
+                        spec,
+                    )?;
                     wav_writer = Some(writer);
                     silence_frames = 0;
 
                     state = next_state;
-
                 } else if mn_state == esp_sr::esp_mn_state_t_ESP_MN_STATE_TIMEOUT {
                     let next_state = State::WakeWordDetecting;
                     State::log_transition(state, next_state, "Command detection timeout");
@@ -561,7 +682,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                     call_c_method!(afe_handle, enable_wakenet, afe_data)?;
                     state = next_state;
                 }
-            },
+            }
 
             State::Recording => {
                 // Check VAD state
@@ -581,15 +702,24 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
 
                 if vad_state == sys::esp_sr::vad_state_t_VAD_SILENCE {
                     silence_frames += 1;
-                    
+
                     // Maybe increase this value to avoid cutting off speech too early
-                    if silence_frames >= frames_per_second * 2 { // 2 seconds of silence 
+                    if silence_frames >= frames_per_second * 2 {
+                        // 2 seconds of silence
                         let next_state = State::WakeWordDetecting;
-                        State::log_transition(state, next_state, &format!("Detected {} frames of silence", silence_frames));
+                        State::log_transition(
+                            state,
+                            next_state,
+                            &format!("Detected {} frames of silence", silence_frames),
+                        );
 
                         // Finalize WAV file
                         if let Some(writer) = wav_writer.take() {
-                            log::info!("Finalizing WAV file after {} silent frames", silence_frames);
+                            log::info!(
+                                "Finalizing WAV file after {} silent frames",
+                                silence_frames
+                            );
+
                             writer.finalize()?;
 
                             // Flush the filesystem to ensure all data is written
@@ -597,10 +727,13 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                                 log::warn!("Failed to flush filesystem: {}", e);
                             } else {
                                 log::info!("Filesystem flushed successfully");
-                                
+
                                 // Send a message to the transcription thread to process the file
                                 let file_path = format!("/vfat/audio{}.wav", file_idx - 1);
-                                if let Err(e) = arg.transcription_tx.send(TranscriptionMessage::TranscribeFile { path: file_path }) {
+                                if let Err(e) = arg
+                                    .transcription_tx
+                                    .send(TranscriptionMessage::TranscribeFile { path: file_path })
+                                {
                                     log::error!("Failed to send transcription message: {}", e);
                                 } else {
                                     log::info!("Sent audio file for asynchronous transcription");
@@ -615,7 +748,10 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
                 } else {
                     // Reset silence counter when we detect speech
                     if silence_frames > 0 {
-                        log::debug!("Speech detected after {} silent frames, resetting silence counter", silence_frames);
+                        log::debug!(
+                            "Speech detected after {} silent frames, resetting silence counter",
+                            silence_frames
+                        );
                     }
                     silence_frames = 0;
                 }
@@ -624,7 +760,7 @@ fn inner_fetch_proc(arg: &Box<FetchTaskArg>) -> anyhow::Result<()> {
     }
 }
 
-extern "C" fn fetch_proc(arg: * mut std::ffi::c_void) {
+extern "C" fn fetch_proc(arg: *mut std::ffi::c_void) {
     let feed_arg = unsafe { Box::from_raw(arg as *mut FetchTaskArg) };
 
     let res = inner_fetch_proc(&feed_arg);
@@ -640,18 +776,22 @@ fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
         log::info!("--- AFE Configuration ---");
 
         // AEC configuration
-        log::info!("AEC: init={}, mode={}, filter_length={}",
+        log::info!(
+            "AEC: init={}, mode={}, filter_length={}",
             (*afe_config).aec_init,
             (*afe_config).aec_mode,
-            (*afe_config).aec_filter_length);
+            (*afe_config).aec_filter_length
+        );
 
         // SE configuration
         log::info!("SE: init={}", (*afe_config).se_init);
 
         // NS configuration
-        log::info!("NS: init={}, mode={}",
+        log::info!(
+            "NS: init={}, mode={}",
             (*afe_config).ns_init,
-            (*afe_config).afe_ns_mode);
+            (*afe_config).afe_ns_mode
+        );
 
         // VAD configuration
         log::info!("VAD: init={}, mode={}, min_speech_ms={}, min_noise_ms={}, delay_ms={}, mute_playback={}, enable_channel_trigger={}",
@@ -664,23 +804,29 @@ fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
             (*afe_config).vad_enable_channel_trigger);
 
         // WakeNet configuration
-        log::info!("WakeNet: init={}, mode={}",
+        log::info!(
+            "WakeNet: init={}, mode={}",
             (*afe_config).wakenet_init,
-            (*afe_config).wakenet_mode);
+            (*afe_config).wakenet_mode
+        );
 
         // AGC configuration
-        log::info!("AGC: init={}, mode={}, compression_gain_db={}, target_level_dbfs={}",
+        log::info!(
+            "AGC: init={}, mode={}, compression_gain_db={}, target_level_dbfs={}",
             (*afe_config).agc_init,
             (*afe_config).agc_mode,
             (*afe_config).agc_compression_gain_db,
-            (*afe_config).agc_target_level_dbfs);
+            (*afe_config).agc_target_level_dbfs
+        );
 
         // PCM configuration
-        log::info!("PCM: total_ch_num={}, mic_num={}, ref_num={}, sample_rate={}",
+        log::info!(
+            "PCM: total_ch_num={}, mic_num={}, ref_num={}, sample_rate={}",
             (*afe_config).pcm_config.total_ch_num,
             (*afe_config).pcm_config.mic_num,
             (*afe_config).pcm_config.ref_num,
-            (*afe_config).pcm_config.sample_rate);
+            (*afe_config).pcm_config.sample_rate
+        );
 
         // General AFE configuration
         log::info!("General AFE: mode={}, type={}, preferred_core={}, preferred_priority={}, ringbuf_size={}, linear_gain={}",
@@ -691,10 +837,12 @@ fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
             (*afe_config).afe_ringbuf_size,
             (*afe_config).afe_linear_gain);
 
-        log::info!("Memory allocation mode={}, debug_init={}, fixed_first_channel={}",
+        log::info!(
+            "Memory allocation mode={}, debug_init={}, fixed_first_channel={}",
             (*afe_config).memory_alloc_mode,
             (*afe_config).debug_init,
-            (*afe_config).fixed_first_channel);
+            (*afe_config).fixed_first_channel
+        );
 
         log::info!("--- End of AFE Configuration ---");
     }
@@ -703,8 +851,8 @@ fn print_afe_config(afe_config: *const esp_sr::afe_config_t) {
 // Enhanced WiFi initialization function with better error handling and reconnection logic
 fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<Box<EspWifi<'static>>> {
     // Get SSID and password from environment variables (mandatory)
-    let ssid = env!("WIFI_SSID", "WIFI_SSID environment variable must be set");
-    let pass = env!("WIFI_PASS", "WIFI_PASS environment variable must be set");
+    let ssid = env!("WIFI_SSID");
+    let pass = env!("WIFI_PASS");
 
     log::info!("Connecting to WiFi network: {}", ssid);
 
@@ -727,8 +875,14 @@ fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<Box<EspWifi<'stat
     };
 
     // Copy SSID and password into heapless Strings
-    client_config.ssid.push_str(ssid).map_err(|_| anyhow::anyhow!("SSID too long"))?;
-    client_config.password.push_str(pass).map_err(|_| anyhow::anyhow!("Password too long"))?;
+    client_config
+        .ssid
+        .push_str(ssid)
+        .map_err(|_| anyhow::anyhow!("SSID too long"))?;
+    client_config
+        .password
+        .push_str(pass)
+        .map_err(|_| anyhow::anyhow!("Password too long"))?;
 
     wifi.set_configuration(&Configuration::Client(client_config))?;
 
@@ -742,7 +896,11 @@ fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<Box<EspWifi<'stat
     for attempt in 1..=max_retries {
         match wifi.connect() {
             Ok(_) => {
-                log::info!("WiFi connect initiated (attempt {}/{}), waiting for connection...", attempt, max_retries);
+                log::info!(
+                    "WiFi connect initiated (attempt {}/{}), waiting for connection...",
+                    attempt,
+                    max_retries
+                );
 
                 // Wait for connection with timeout
                 let max_wait_seconds = 15; // Increased timeout for DHCP
@@ -766,7 +924,10 @@ fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<Box<EspWifi<'stat
                                 has_valid_ip = true;
                                 break; // Successfully connected with valid IP
                             } else {
-                                log::debug!("Connected but waiting for DHCP (IP: {})...", ip_info.ip);
+                                log::debug!(
+                                    "Connected but waiting for DHCP (IP: {})...",
+                                    ip_info.ip
+                                );
                             }
                         }
                     }
@@ -776,16 +937,27 @@ fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<Box<EspWifi<'stat
                     log::info!("WiFi connected successfully with valid IP address!");
                     break;
                 } else if connected {
-                    log::warn!("Connected to WiFi but failed to get valid IP address after {} seconds", max_wait_seconds);
+                    log::warn!(
+                        "Connected to WiFi but failed to get valid IP address after {} seconds",
+                        max_wait_seconds
+                    );
                     // Disconnect and retry to force new DHCP exchange
                     let _ = wifi.disconnect();
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 } else {
-                    log::warn!("WiFi connection timed out after {} seconds", max_wait_seconds);
+                    log::warn!(
+                        "WiFi connection timed out after {} seconds",
+                        max_wait_seconds
+                    );
                 }
-            },
+            }
             Err(e) => {
-                log::error!("Failed to connect to WiFi (attempt {}/{}): {}", attempt, max_retries, e);
+                log::error!(
+                    "Failed to connect to WiFi (attempt {}/{}): {}",
+                    attempt,
+                    max_retries,
+                    e
+                );
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
         }
@@ -800,7 +972,10 @@ fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<Box<EspWifi<'stat
         // Return the wifi object in a Box to maintain ownership
         Ok(Box::new(wifi))
     } else {
-        let err_msg = format!("Failed to connect to WiFi '{}' after {} attempts", ssid, max_retries);
+        let err_msg = format!(
+            "Failed to connect to WiFi '{}' after {} attempts",
+            ssid, max_retries
+        );
         log::error!("{}", err_msg);
         Err(anyhow::anyhow!(err_msg))
     }
@@ -809,23 +984,22 @@ fn initialize_wifi(modem: hal::modem::Modem) -> anyhow::Result<Box<EspWifi<'stat
 // Test function for LLM functionality with improved error handling
 fn test_llm_helper() -> anyhow::Result<()> {
     // Get token from environment variable at compile time
-    let token = env!("LLM_AUTH_TOKEN", "LLM authentication token must be set at compile time");
+    let token = env!("LLM_AUTH_TOKEN");
 
     log::info!("Creating LlmHelper instance to test DeepSeek API integration");
 
     // Create LLM helper with error handling
-    let mut llm = match std::panic::catch_unwind(|| {
-        llm_intf::LlmHelper::new(token, "deepseek-chat")
-    }) {
-        Ok(helper) => helper,
-        Err(_) => return Err(anyhow::anyhow!("Failed to initialize LlmHelper"))
-    };
+    let mut llm =
+        match std::panic::catch_unwind(|| llm_intf::LlmHelper::new(token, "deepseek-chat")) {
+            Ok(helper) => helper,
+            Err(_) => return Err(anyhow::anyhow!("Failed to initialize LlmHelper")),
+        };
 
     // Configure parameters with reasonable defaults for embedded use
     llm.configure(
-        Some(256),  // Smaller token count to conserve memory
-        Some(0.7),  // Temperature - balanced between deterministic and creative
-        Some(0.9)   // Top-p - slightly more focused sampling
+        Some(256), // Smaller token count to conserve memory
+        Some(0.7), // Temperature - balanced between deterministic and creative
+        Some(0.9), // Top-p - slightly more focused sampling
     );
 
     // Send a test message
@@ -880,12 +1054,26 @@ fn main() -> anyhow::Result<()> {
         Ok(wifi) => {
             log::info!("WiFi connected successfully");
             wifi
-        },
+        }
         Err(e) => {
             log::error!("Failed to connect to WiFi: {}", e);
             return Err(e);
         }
     };
+
+    // Configure MAX98357 control pins first
+    let (_gain_pin_driver, _sd_pin_driver) =
+        configure_max98357_pins(peripherals.pins.gpio4, peripherals.pins.gpio5)?;
+
+    // Initialize I2S TX driver for audio output
+    let i2s_tx_driver = init_i2s_tx(
+        peripherals.i2s1,
+        peripherals.pins.gpio2,
+        peripherals.pins.gpio3,
+        peripherals.pins.gpio1,
+    )?;
+
+    log::info!("I2S TX channel configured for audio output");
 
     // Test the LLM helper
     /*match test_llm_helper() {
@@ -908,7 +1096,9 @@ fn main() -> anyhow::Result<()> {
     let models = unsafe { esp_srmodel_init(part_name.as_ptr()) };
     if models.is_null() {
         log::error!("Failed to initialize speech recognition models");
-        return Err(anyhow::anyhow!("Failed to initialize speech recognition models"));
+        return Err(anyhow::anyhow!(
+            "Failed to initialize speech recognition models"
+        ));
     }
 
     let input_format = CString::new("M").unwrap();
@@ -987,11 +1177,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Start the transcription worker thread
-    let transcription_tx = match start_transcription_worker() {
+    let transcription_tx = match start_transcription_worker(i2s_tx_driver) {
         Ok(tx) => tx,
         Err(e) => {
             log::error!("Failed to start transcription worker: {}", e);
-            return Err(anyhow::anyhow!("Failed to start transcription worker: {}", e));
+            return Err(anyhow::anyhow!(
+                "Failed to start transcription worker: {}",
+                e
+            ));
         }
     };
     log::info!("Transcription worker started successfully");
@@ -1013,7 +1206,7 @@ fn main() -> anyhow::Result<()> {
             8 * 1024,
             Box::into_raw(feed_task_arg) as *mut c_void,
             5,
-            None
+            None,
         )
     }?;
     log::info!("Feed task created successfully");
@@ -1035,13 +1228,16 @@ fn main() -> anyhow::Result<()> {
             8 * 1024,
             Box::into_raw(fetch_task_arg) as *mut c_void,
             5,
-            None
+            None,
         )
     }?;
     log::info!("Fetch task created successfully");
 
     // Log initialization time
-    log::info!("AI Chatbox initialization completed in {} ms", init_timer.elapsed().as_millis());
+    log::info!(
+        "AI Chatbox initialization completed in {} ms",
+        init_timer.elapsed().as_millis()
+    );
 
     // Simple infinite loop for embedded application - this is standard practice
     // for embedded applications where the main thread can just sleep
