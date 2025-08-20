@@ -4,13 +4,12 @@ use esp_idf_svc::hal::{
     gpio::{Gpio41, Gpio42, InputPin, OutputPin, PinDriver},
     i2s::{
         config::{
-            ClockSource, Config, DataBitWidth, MclkMultiple, PdmDownsample, PdmRxClkConfig,
-            PdmRxConfig, PdmRxGpioConfig, PdmRxSlotConfig, SlotMode, StdConfig, StdClkConfig, StdGpioConfig, StdSlotConfig
+            ClockSource, Config, DataBitWidth, MclkMultiple, PdmDownsample, PdmRxClkConfig, PdmRxConfig, PdmRxGpioConfig, PdmRxSlotConfig, SlotMode, StdClkConfig, StdConfig, StdGpioConfig, StdSlotConfig
         },
         I2s, I2sDriver, I2sRx, I2sTx, I2S0, I2S1,
     },
     peripheral::Peripheral,
-    peripherals::Peripherals,
+    peripherals::Peripherals, sd,
 };
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
@@ -175,6 +174,7 @@ enum TranscriptionMessage {
 fn transcription_worker(
     rx: Receiver<TranscriptionMessage>,
     mut i2s_driver: I2sDriver<'static, I2sTx>,
+    mut sd_pin_driver: PinDriver<'static, impl OutputPin, esp_idf_svc::hal::gpio::Output>,
 ) -> anyhow::Result<()> {
     log::info!("Transcription worker thread started");
 
@@ -198,7 +198,7 @@ fn transcription_worker(
 
     // Send initial system message to set context
     llm.send_message(
-        "接下来的请求来自一个语音转文字服务，请小心中间可能有一些字词被识别成同音的字词。回答请简短，只需要一段文字，不要超过80个字。"
+        "接下来的请求来自一个语音转文字服务，请小心中间可能有一些字词被识别成同音的字词。请不要使用列表，回答保持一个段落。"
             .to_string(),
         ChatRole::System,
     );
@@ -221,7 +221,9 @@ fn transcription_worker(
         }
     };
 
+    sd_pin_driver.set_high().unwrap();
     tts_engine.synthesize_and_play("你好，乐鑫", &mut i2s_driver);
+    sd_pin_driver.set_low().unwrap();
 
     loop {
         match rx.recv() {
@@ -245,6 +247,7 @@ fn transcription_worker(
                             // Convert LLM response to audio using TTS
                             log::info!("Converting LLM response to audio...");
 
+                            sd_pin_driver.set_high().unwrap(); // Ensure SD pin is enabled
                             if let Err(e) =
                                 tts_engine.synthesize_and_play(&response, &mut i2s_driver)
                             {
@@ -252,6 +255,7 @@ fn transcription_worker(
                             } else {
                                 log::info!("Audio synthesis and playback completed successfully");
                             }
+                            sd_pin_driver.set_low().unwrap(); // Ensure SD pin is disabled
                         }
                     }
                     Err(e) => {
@@ -277,6 +281,7 @@ fn transcription_worker(
 // Function to create and start the transcription worker thread
 fn start_transcription_worker(
     i2s_driver: I2sDriver<'static, I2sTx>,
+    sd_pin_driver: PinDriver<'static, impl OutputPin, esp_idf_svc::hal::gpio::Output>,
 ) -> anyhow::Result<Sender<TranscriptionMessage>> {
     let (tx, rx) = mpsc::channel();
 
@@ -284,7 +289,7 @@ fn start_transcription_worker(
         .name("transcription_worker".to_string())
         .stack_size(16 * 1024) // Increase stack size for TTS operations
         .spawn(move || {
-            if let Err(e) = transcription_worker(rx, i2s_driver) {
+            if let Err(e) = transcription_worker(rx, i2s_driver, sd_pin_driver) {
                 log::error!("Transcription worker failed: {}", e);
             }
         })?;
@@ -380,24 +385,15 @@ fn init_i2s_tx(
 }
 
 fn configure_max98357_pins(
-    gain_pin: impl Peripheral<P = impl OutputPin> + 'static,
     sd_pin: impl Peripheral<P = impl OutputPin> + 'static,
-) -> anyhow::Result<(
-    PinDriver<'static, impl OutputPin, esp_idf_svc::hal::gpio::Output>,
-    PinDriver<'static, impl OutputPin, esp_idf_svc::hal::gpio::Output>,
-)> {
-    // Configure MAX98357 control pins
-    // GAIN pin (GPIO4) - controls gain level
-    let mut gain_pin_driver = PinDriver::output(gain_pin)?;
-    gain_pin_driver.set_high()?; // Set gain to 15dB (high), or set_low() for 9dB
-
+) -> anyhow::Result<PinDriver<'static, impl OutputPin, esp_idf_svc::hal::gpio::Output>> {
     // SD pin (GPIO5) - shutdown control (active low)
     let mut sd_pin_driver = PinDriver::output(sd_pin)?;
-    sd_pin_driver.set_high()?; // Enable the amplifier (not shutdown)
+    sd_pin_driver.set_low()?; // Enable the amplifier (not shutdown)
 
     log::info!("MAX98357 control pins configured");
 
-    Ok((gain_pin_driver, sd_pin_driver))
+    Ok(sd_pin_driver)
 }
 
 macro_rules! call_c_method {
@@ -1062,8 +1058,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Configure MAX98357 control pins first
-    let (_gain_pin_driver, _sd_pin_driver) =
-        configure_max98357_pins(peripherals.pins.gpio4, peripherals.pins.gpio5)?;
+    let sd_pin_driver =
+        configure_max98357_pins(peripherals.pins.gpio5)?;
 
     // Initialize I2S TX driver for audio output
     let i2s_tx_driver = init_i2s_tx(
@@ -1177,7 +1173,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Start the transcription worker thread
-    let transcription_tx = match start_transcription_worker(i2s_tx_driver) {
+    let transcription_tx = match start_transcription_worker(i2s_tx_driver, sd_pin_driver) {
         Ok(tx) => tx,
         Err(e) => {
             log::error!("Failed to start transcription worker: {}", e);
