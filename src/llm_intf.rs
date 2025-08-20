@@ -110,7 +110,7 @@ pub struct LlmHelper {
 impl LlmHelper {
     /// Create a new instance of LlmHelper
     pub fn new(api_token: &str, model_name: &str) -> Self {
-        let mut helper = LlmHelper {
+        let helper = LlmHelper {
             api_endpoint: "https://api.deepseek.com/chat/completions".to_string(),
             api_token: api_token.to_string(),
             model_name: model_name.to_string(),
@@ -135,15 +135,7 @@ impl LlmHelper {
     #[allow(dead_code)]
     pub fn clear_history(&mut self) {
         if !self.message_history.is_empty() {
-            // Preserve system message if it exists
-            let system_messages: Vec<ChatMessage> = self
-                .message_history
-                .iter()
-                .filter(|msg| msg.role == "system")
-                .cloned()
-                .collect();
-
-            self.message_history = system_messages;
+            self.message_history = Vec::new();
         }
     }
 

@@ -27,7 +27,7 @@ def transcribe():
 
     os.remove(temp_path)  # 删除临时文件
     result = recognizer.FinalResult()
-    return result
+    return result["text"]
     #return jsonify({"text": result[0]})
 
 if __name__ == '__main__':
